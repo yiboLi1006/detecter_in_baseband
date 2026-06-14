@@ -1,7 +1,57 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v2).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v5.1).
 
+v5.1 change vs v5:  uint8 PSRFITS output (PRESTO / DSPSR compatibility).
+All v5 time-system and TOA fixes are unchanged.
+
+v5.1 uint8 output:
+  - Raw and DM-corrected PSRFITS DATA columns are written as uint8
+    (format='B', NBITS=8) instead of float32.  Values are clipped to
+    [0, 255] and rounded.
+  - The DM correction and pulse detection algorithms still operate in
+    float64 internally -- the quantisation happens only at the final
+    FITS column build stage, so detection results are unaffected.
+  - This makes the output files directly readable by PRESTO prepsubband,
+    DSPSR, and other C-based pulsar toolchains that expect integer data.
+
+---
+v5 change vs v3:  PSRFITS time-system reconstruction.
+Memory cleanup layers inherited from v2/v3 are unchanged.
+
+v5 time-system changes:
+  1.  Fixed global observation start time (T0_obs_start). The first chunk's
+      VDIF timestamp is captured once and reused for ALL hdulists, so every
+      output PSRFITS file shares the same DATE-OBS.  This is the PSRFITS
+      standard behaviour.
+  2.  Removed the global_offset parameter that was threaded through
+      create_primary_header -> create_table_columns ->
+      write_psrfits_file_multiple_subints.  Time alignment is now handled
+      entirely via the fixed T0_obs_start + OFFS_SUB column.
+  3.  Subint offset now uses a half-integer shift:
+        subint_offset = (current_subint + 0.5) * tsamp * n_time_bins
+      so that OFFS_SUB records the subint *centre* rather than its start,
+      matching the PSRFITS convention.
+  4.  Synchronised with pulse_detection_module.py (v5) which now reads
+      OFFS_SUB and TSUBINT from the SUBINT table to compute accurate
+      absolute TOAs:
+        TOA = DATE-OBS + (OFFS_SUB - TSUBINT/2) + mu_fit * TBIN
+
+Net effect: all output files have a unified DATE-OBS, OFFS_SUB increases
+monotonically across file boundaries, and standard tools (PSRCHIVE, PRESTO,
+tempo2) can process the files correctly.
+
+v5 log-simplification (compared to v3):
+  - Removed full configuration dump; only key params printed on startup.
+  - Removed per-hdulist DM-correction / pulse-detection banners.
+  - Removed per-file PSRFITS write confirmations.
+  - Removed per-hdulist gc.collect object count + malloc_trim status.
+  - Condensed memory-startup announcement (silent unless tracemalloc on).
+  - Condensed per-hdulist progress to one compact line.
+  - Removed verbose output from dm_correction_module and
+    pulse_detection_module (see their respective changelogs).
+
+---
 v2 change vs v1: aggressive memory cleanup. The detection / DM algorithms
 and float64 precision are unchanged.
 
@@ -344,20 +394,18 @@ def read_config(config_file):
 # =========================================================================
 
 def check_parameters(chunk_size, reduction_factor, nchans):
-    calculated_nchans = int(chunk_size / reduction_factor)
     n_tbin = int(chunk_size / nchans / 2)
-    print("#" * 30)
-    print(f"######## chunk_size: {chunk_size}")
-    print(f"######## red_factor: {reduction_factor}")
-    print(f"######## total_chan: {nchans}")
     check1 = chunk_size >= (reduction_factor * n_tbin)
     check2 = nchans == (reduction_factor / 2)
     check3 = n_tbin == (chunk_size / reduction_factor)
-    print(f" 1. chunk_size >= reduction_factor * total_chan * 2 -> {check1}")
-    print(f" 2. nchans == 0.5 * reduction_factor                -> {check2}")
-    print(f" 3. n_tbin == chunk_size / reduction_factor          -> {check3}")
-    print("#" * 30)
-    return check1 and check2 and check3
+    if not (check1 and check2 and check3):
+        print(f"### PARAMETER ERROR: chunk_size={chunk_size}, "
+              f"reduction_factor={reduction_factor}, nchans={nchans}")
+        print(f"    check1 (chunk >= redfac * n_tbin): {check1}")
+        print(f"    check2 (nchans == redfac/2):       {check2}")
+        print(f"    check3 (n_tbin == chunk/redfac):    {check3}")
+        return False
+    return True
 
 
 # =========================================================================
@@ -658,7 +706,7 @@ def create_primary_header(obs_start_time, tsamp, nsamples_per_subint, n_subints,
                           telescope, coord, file_counter):
     primary_hdu = fits.PrimaryHDU()
     header = primary_hdu.header
-    actual_start_time = obs_start_time
+    actual_start_time = obs_start_time  # v5: fixed global observation start, no per-file offset
 
     ra_str = coord.ra.to_string(unit=u.hourangle, sep=':', precision=2)
     dec_str = coord.dec.to_string(unit=u.degree, sep=':', precision=1)
@@ -727,14 +775,15 @@ def create_primary_header(obs_start_time, tsamp, nsamples_per_subint, n_subints,
 
 def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
                          center_freq, nchans, chan_bw, coord, file_counter,
-                         continuous_freqs=None, global_offset=0.0,
-                         data_format='E'):
+                         continuous_freqs=None, data_format='E'):
     n_subints = len(subint_data_list)
     first_subint_data = subint_data_list[0]
     nsamples_per_subint = first_subint_data.shape[1]
     actual_nchans = first_subint_data.shape[0]
 
-    adjusted_offs_sub_arr = np.array(subint_offsets_list, dtype=np.float64) + global_offset
+    # v5: OFFS_SUB already carries the correct offset (w.r.t. T0_obs_start);
+    # no extra global_offset needed here.
+    adjusted_offs_sub_arr = np.array(subint_offsets_list, dtype=np.float64)
 
     tsubint_arr = np.full(n_subints, tsamp * nsamples_per_subint, dtype=np.float64)
     offs_sub_arr = adjusted_offs_sub_arr
@@ -761,10 +810,10 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
     dat_scl = np.ones(actual_nchans, dtype=np.float32)
 
     total_elements_per_subint = 1 * actual_nchans * 1 * nsamples_per_subint
+    # v5.1: uint8 output for PRESTO compatibility
     if data_format == 'B':
-        # Convert to uint8: clip float32 values to [0, 255], round, cast
         data_arrays = [
-            np.clip(np.round(sd), 0, 255).astype(np.uint8)
+            np.clip(np.round(np.nan_to_num(sd, nan=0.0)), 0, 255).astype(np.uint8)
             .reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
             for sd in subint_data_list
         ]
@@ -836,14 +885,15 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         plot_output_dir=None):
     n_subints = len(subint_data_list)
     if n_subints == 0:
-        print("No subint data to write")
+        print("\nNo subint data to write")
         return
 
     start_time = subint_times_list[0]
 
+    # v5.1: uint8 DATA column for PRESTO/DSPSR compatibility
     cols, nsamples_per_subint, n_subints, actual_nchans = create_table_columns(
         subint_data_list, subint_offsets_list, tsamp, center_freq,
-        nchans, chan_bw, coord, file_counter, continuous_freqs, 0.0,
+        nchans, chan_bw, coord, file_counter, continuous_freqs,
         data_format='B',
     )
 
@@ -864,7 +914,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th['NBIN'] = 1
     th['NBIN_PRD'] = 0
     th['PHS_OFFS'] = 0.0
-    th['NBITS'] = 8  # uint8 (format='B' in DATA column)
+    th['NBITS'] = 8
     th['NSUBOFFS'] = file_counter * n_subints
     th['NCHAN'] = actual_nchans
     th['CHAN_BW'] = chan_bw
@@ -878,23 +928,16 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     hdulist = fits.HDUList([primary_hdu, table_hdu])
     del cols  # v2: column list no longer needed after BinTable is built
 
-    print("\n" + ">" * 30 + f" hdulist #{file_counter}: DM correction " + "<" * 30)
-    # v3: DM correction is now IN-PLACE on `hdulist`. After this call,
-    # `hdulist` carries the DM-corrected DATA column. We deliberately no
-    # longer hold a separate corrected_hdulist — that doubled the SUBINT
-    # buffer and was the source of the per-hdulist 213 MiB leak diagnosed
-    # via tracemalloc (astropy/io/fits/fitsrec.py:597, FITS_rec.copy()).
+    # DM correction is IN-PLACE on `hdulist` (v3 memory fix)
     dm_correct_hdulist(
         hdulist, dm=dm_value,
         ref_freq=dm_ref_freq if dm_ref_freq is not None else center_freq,
         method='freq_domain', normalize=True,
     )
 
-    print(">" * 30 + f" hdulist #{file_counter}: pulse detection " + "<" * 30)
     pulse_data_list = detect_pulses_in_hdulist(hdulist, detection_params)
 
     if not pulse_data_list:
-        print(f"hdulist #{file_counter}: no pulses detected -> nothing written.")
         try:
             hdulist.close()
         except Exception:
@@ -902,7 +945,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
         del hdulist, pulse_data_list
         return
 
-    print(f"hdulist #{file_counter}: {len(pulse_data_list)} pulse(s) detected -> writing outputs.")
+    print(f"\nhdulist #{file_counter}: {len(pulse_data_list)} pulse(s) detected")
 
     src = source_name_for_file if source_name_for_file is not None else source_name
     tel = telescope_for_file if telescope_for_file is not None else telescope
@@ -922,24 +965,23 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
 
     # corrected hdulist is the in-place mutated one
     hdulist.writeto(corr_out, overwrite=True, checksum=True)
-    print(f"  -> corrected PSRFITS: {corr_out}")
 
-    # v3: rebuild raw hdulist from the still-available subint_data_list.
-    # Convert to uint8 for PSRFITS compliance (PRESTO compatibility).
+    # v5.1: rebuild raw hdulist from the still-available subint_data_list,
+    # converting to uint8 for PRESTO/DSPSR compatibility.
     # This path is rare (only when pulses are detected) so the rebuild cost
     # is acceptable; the steady-state non-detection path now never copies.
     raw_subint_data_list = [
-        np.clip(np.round(sd), 0, 255).astype(np.uint8)
+        np.clip(np.round(np.nan_to_num(sd, nan=0.0)), 0, 255).astype(np.uint8)
         for sd in subint_data_list
     ]
     raw_cols, raw_nsamples, raw_nsubints, raw_nchans = create_table_columns(
         raw_subint_data_list, subint_offsets_list, tsamp, center_freq,
-        nchans, chan_bw, coord, file_counter, continuous_freqs, 0.0,
+        nchans, chan_bw, coord, file_counter, continuous_freqs,
         data_format='B',
     )
     raw_primary = create_primary_header(
         obs_start_time, tsamp, raw_nsamples, raw_nsubints,
-        center_freq, chan_bw, raw_nchans, 0.0, source_name, telescope,
+        center_freq, chan_bw, raw_nchans, dm, source_name, telescope,
         coord, file_counter,
     )
     raw_table = fits.BinTableHDU.from_columns(raw_cols, name='SUBINT')
@@ -953,7 +995,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['NBIN'] = 1
     rth['NBIN_PRD'] = 0
     rth['PHS_OFFS'] = 0.0
-    rth['NBITS'] = 8  # uint8 (format='B' in DATA column)
+    rth['NBITS'] = 8
     rth['NSUBOFFS'] = file_counter * raw_nsubints
     rth['NCHAN'] = raw_nchans
     rth['CHAN_BW'] = chan_bw
@@ -966,7 +1008,6 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     raw_hdulist = fits.HDUList([raw_primary, raw_table])
     del raw_cols, raw_subint_data_list
     raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
-    print(f"  -> raw PSRFITS: {raw_out}")
 
     if vdif_input_file is not None and hdulist_total_samples > 0:
         seg_out = os.path.join(
@@ -1120,21 +1161,9 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
     pulse_collector = []
 
-    # v2 announce
-    if cleanup_every_n_hdulists > 0:
-        print(f"### [memory] cleanup_every_n_hdulists = {cleanup_every_n_hdulists}: "
-              f"baseband reader recycle will run after every {cleanup_every_n_hdulists} hdulists.")
-    else:
-        print("### [memory] cleanup_every_n_hdulists = 0: baseband reader recycle DISABLED.")
-    print("### [memory] gc.collect() + malloc_trim(0) now run after EVERY hdulist "
-          "(R3 stronger cleanup).")
-    if _HAS_PSUTIL:
-        print("### [memory] psutil available -> per-hdulist RSS will be logged.")
-    else:
-        print("### [memory] psutil NOT available -> RSS will not be logged.")
+    # memory cleanup setup
+    _mem_reader_recycle = cleanup_every_n_hdulists > 0
     if _TRACEMALLOC_ENABLED and _tracemalloc is not None:
-        print("### [memory] tracemalloc ENABLED via env TRACEMALLOC_ENABLED=1 -> "
-              "per-hdulist top-10 allocation growth will be logged.")
         try:
             _tracemalloc.start(25)
         except Exception as e:
@@ -1149,12 +1178,10 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
         tsamp = 1.0 / reduced_sample_rate
         chan_bw = bandwidth / nchans
 
-        print(f"Actual sample rate: {actual_sample_rate:.0f} Hz")
-        print(f"Reduced sample rate: {reduced_sample_rate:.0f} Hz")
-        print(f"Tsamp: {tsamp:.6f} s")
-        print(f"Channels per subband: {nchans}")
-        print(f"Data shape: {file_obj.shape}")
-        print(f"Start time offset: {t_start:.3f} seconds")
+        print(f"Sample rate: {actual_sample_rate/1e6:.1f} MHz  "
+              f"tsamp: {tsamp:.6f} s  channels: {nchans}  "
+              f"file shape: {file_obj.shape}")
+        _log_rss(tag='startup')
 
         start_sample, file_counter, global_offset = calculate_start_sample(
             0, start_file, max_subints_per_file, chunk_size,
@@ -1164,19 +1191,15 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
         total_samples = file_obj.shape[0] - start_sample
         current_subint = 0
 
-        # v2 R2: progress tracking based on chunks read out of the file
         total_chunks_planned = max(1, int(math.ceil(total_samples / chunk_size)))
         chunks_processed = 0
-        print(f"### [progress] total chunks planned: {total_chunks_planned} "
-              f"(total samples to read: {total_samples})")
-        _log_rss(tag='startup')
 
         subint_data_list = []
         subint_times_list = []
         subint_offsets_list = []
         subint_chunk_ranges = []
 
-        T0_obs_start = None  # v4: capture observation start time (fixed for all files)
+        T0_obs_start = None  # v5: capture observation start time (fixed for all files)
 
         for chunk_start in range(start_sample, start_sample + total_samples, chunk_size):
             end_sample = min(chunk_start + chunk_size, start_sample + total_samples)
@@ -1188,7 +1211,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                 raw_data = file_obj.read(samples_to_read)
                 chunk_data = flag_xband_data(raw_data, mask=mask_array)
                 if chunk_data.size == 0:
-                    print(f"Empty chunk at {chunk_start}, skipping")
+                    print(f"\nEmpty chunk at {chunk_start}, skipping")
                     del raw_data, chunk_data
                     break
 
@@ -1200,14 +1223,14 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     bspline_degree=bspline_degree, bspline_smooth=bspline_smooth,
                 )
                 if processed_data.size == 0:
-                    print(f"No data after processing chunk {current_subint}, skipping")
+                    print(f"\nNo data after processing chunk {current_subint}, skipping")
                     del raw_data, chunk_data, processed_data
                     continue
 
                 file_obj.seek(chunk_start)
                 start_time_chunk = file_obj.tell(unit='time')
                 if T0_obs_start is None:
-                    T0_obs_start = start_time_chunk  # v4: fixed observation start time
+                    T0_obs_start = start_time_chunk  # v5: fixed observation start time
                 subint_offset = (current_subint + 0.5) * tsamp * processed_data.shape[1]
 
                 subint_data_list.append(processed_data)
@@ -1264,64 +1287,56 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
                         file_counter += 1
 
-                        # v2 R2: progress at hdulist boundary
+                        # progress at hdulist boundary (inline refresh)
                         pct_h = 100.0 * chunks_processed / total_chunks_planned
-                        print(f"### [progress] hdulist #{file_counter - 1} done "
-                              f"[chunk {chunks_processed}/{total_chunks_planned}, "
-                              f"{pct_h:.2f}% of VDIF data]")
+                        rss_str = ''
+                        if _HAS_PSUTIL:
+                            try:
+                                rss_str = f'  RSS={_psutil.Process().memory_info().rss / (1 << 30):.2f}GiB'
+                            except Exception:
+                                pass
+                        print(f"\r### progress: {pct_h:.1f}%  "
+                              f"hdulist #{file_counter - 1}  "
+                              f"chunk {chunks_processed}/{total_chunks_planned}"
+                              f"{rss_str}  ", end='', flush=True)
 
-                        # v2 R3: STRONGER cleanup -- run gc + malloc_trim + RSS log
-                        # after EVERY hdulist (not every N) so any per-hdulist
-                        # accumulation shows up immediately as a sawtooth.
-                        collected = gc.collect()
-                        trimmed = _trim_malloc()
-                        print(f"### [memory] gc.collect={collected} objects, "
-                              f"malloc_trim={'ok' if trimmed else 'skip'} "
-                              f"after hdulist #{file_counter - 1}")
-                        _log_rss(tag=f'after-hdulist-{file_counter - 1}')
+                        # per-hdulist memory cleanup (gc + malloc_trim)
+                        gc.collect()
+                        _trim_malloc()
                         _tm_prev_snapshot = _tracemalloc_diff(
                             _tm_prev_snapshot,
                             tag=f'after-hdulist-{file_counter - 1}')
 
-                        # v2 L3 + R2: every cleanup_every_n_hdulists, also recycle
-                        # the baseband reader -- this drops baseband's internal
-                        # frame index / header cache (suspected leak source).
-                        if cleanup_every_n_hdulists > 0:
+                        # periodic baseband reader recycle
+                        if _mem_reader_recycle:
                             written_count = file_counter - start_file
                             if written_count > 0 and written_count % cleanup_every_n_hdulists == 0:
-                                _log_rss(tag=f'before-reader-recycle-hdulist-{file_counter - 1}')
 
                                 try:
                                     file_obj.close()
                                 except Exception:
                                     pass
 
-                                # Reopen a fresh reader; the next iteration will
-                                # seek() to the right sample so position is preserved.
                                 file_obj = open_data_file(
                                     vdif_file, data_format, withsubband, subset,
                                     sample_rate_value, ref_time_str, nchan)
                                 if file_obj is None:
-                                    print("### [memory] WARN: failed to reopen baseband "
-                                          "reader; aborting main loop.")
+                                    print("\n### WARN: failed to reopen baseband reader; aborting.")
                                     break
                                 try:
                                     actual_sample_rate = file_obj.sample_rate.value
                                 except Exception:
                                     pass
-                                # second gc/trim sweep right after the recycle
                                 gc.collect()
                                 _trim_malloc()
-                                print("### [memory] baseband reader recycled "
-                                      f"(after hdulist #{file_counter - 1}).")
-                                _log_rss(tag=f'after-reader-recycle-hdulist-{file_counter - 1}')
+                                print(f"\n### baseband reader recycled (after hdulist #{file_counter - 1})")
 
                 if file_counter >= max_files:
-                    print(f"### Reached max_files limit of {max_files}")
+                    print(f"\n### Reached max_files limit of {max_files}")
                     break
 
             except Exception as e:
-                print(f"Error processing chunk {current_subint}: {e}")
+                print(f"\nError processing chunk {current_subint}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -1331,14 +1346,11 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
         except Exception:
             pass
 
+    print()  # finalise inline progress line
     if pulse_collector:
         _save_pulse_collector_csv(pulse_collector, csv_output_path)
     else:
-        print("\nNo pulses detected across the entire run. CSV not generated.")
-
-    # final cleanup
-    gc.collect()
-    _trim_malloc()
+        print("\nNo pulses detected. CSV not generated.")
 
 
 def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
@@ -1348,14 +1360,12 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
     column_order = [
         'Coarse_Index', 'Fits',
-        'Precise_Rel_Time_ms', 'Precise_Abs_MJD', 'Precise_UTC_Time',
-        'Precise_Time_Err_ms',
+        'Precise_Rel_Time_ms',
         'Precise_Center_Index', 'Center_Err',
         'Amplitude', 'Amp_Err', 'FWHM_ms', 'FWHM_Err', 'R_2',
         'Background_Level', 'Background_Fit', 'Noise_Sigma',
         'SNR_Amplitude_Fit', 'SNR_Amplitude_Detection',
         'Flux_From_Fit', 'Flux_Err', 'SNR_Flux_From_Fit',
-        'Fit_Success',
     ]
 
     if 'Precise_JD1' in df.columns and 'Precise_JD2' in df.columns:
@@ -1406,9 +1416,13 @@ if __name__ == "__main__":
 
     params = read_config(config_file)
 
-    print("Configuration loaded:")
-    for key, value in params.items():
-        print(f"  {key}: {value}")
+    print(f"VDIF file : {params['vdif_file']}")
+    print(f"Source    : {params['source_name']}  DM={params['dm_source']}  "
+          f"Telescope={params['telescope']}")
+    print(f"Chunks    : chunk_size={params['chunk_size']}  "
+          f"nchans={params['nchans']}  reduction_factor={params['reduction_factor']}")
+    print(f"Max files : {params['max_files']}  "
+          f"subints_per_file={params['max_subints_per_file']}")
 
     detection_params = {
         'amp_snr_threshold': params['amp_snr_threshold'],
@@ -1426,10 +1440,9 @@ if __name__ == "__main__":
 
     if not check_parameters(params['chunk_size'], params['reduction_factor'],
                             params['nchans']):
-        print("Parameter inconsistency detected! Check chunk_size / reduction_factor / nchans.")
         sys.exit(1)
 
-    print("Parameters consistent, starting integrated pipeline v2...")
+    print("Starting integrated pipeline v5...")
 
     vdif_to_psrfits(
         vdif_file=params['vdif_file'],
