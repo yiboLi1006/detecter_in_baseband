@@ -10,8 +10,6 @@ Adapted from former_script/dm_cor/dm_cor_psrfits_latest_25-12-12.py.
 """
 
 import numpy as np
-from astropy.io import fits
-
 
 def fractional_shift_freq_domain(x, shift_delta):
     """Shift a real-valued time series 'x' by 'shift_delta' samples (frequency-domain)."""
@@ -196,6 +194,9 @@ def _apply_corrected_data_inplace(hdulist, corrected_data, header_info,
     if ref_freq is not None:
         hdr['HISTORY'] = f'DM reference frequency: {ref_freq} MHz'
     hdr['HISTORY'] = 'DM correction applied in-place (integrated pipeline v3)'
+    hdr['DM'] = dm
+    if ref_freq is not None:
+        hdr['REFFREQ'] = ref_freq
 
     for i in range(nsubint_total):
         start_idx = i * nsblk

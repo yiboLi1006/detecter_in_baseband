@@ -321,10 +321,13 @@ def read_config(config_file):
         params['output_corrected_psrfits_dir'] = config.get('integrated_output',
                                                             'output_corrected_psrfits_dir',
                                                             fallback='./pulse_psrfits_corrected')
+        params['plot_output_dir'] = config.get('integrated_output', 'plot_output_dir',
+                                               fallback='')
     else:
         params['csv_output_path'] = './pulse_csv_results'
         params['output_raw_psrfits_dir'] = './pulse_psrfits_raw'
         params['output_corrected_psrfits_dir'] = './pulse_psrfits_corrected'
+        params['plot_output_dir'] = ''
 
     # -- performance (v2) --
     if config.has_section('performance'):
@@ -819,7 +822,8 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         hdulist_total_samples=0,
                                         source_name_for_file=None,
                                         telescope_for_file=None,
-                                        version_for_file=0):
+                                        version_for_file=0,
+                                        plot_output_dir=None):
     n_subints = len(subint_data_list)
     if n_subints == 0:
         print("No subint data to write")
@@ -857,6 +861,8 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th['NSBLK'] = nsamples_per_subint
     th['EXTVER'] = 1
     th['TDIM16'] = f'(1,{actual_nchans},1,{nsamples_per_subint})'
+    th['DM'] = dm_value if dm_value is not None else dm
+    th['REFFREQ'] = dm_ref_freq if dm_ref_freq is not None else center_freq
 
     hdulist = fits.HDUList([primary_hdu, table_hdu])
     del cols  # v2: column list no longer needed after BinTable is built
@@ -938,6 +944,8 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['NSBLK'] = raw_nsamples
     rth['EXTVER'] = 1
     rth['TDIM16'] = f'(1,{raw_nchans},1,{raw_nsamples})'
+    rth['DM'] = dm_value if dm_value is not None else dm
+    rth['REFFREQ'] = dm_ref_freq if dm_ref_freq is not None else center_freq
     raw_hdulist = fits.HDUList([raw_primary, raw_table])
     del raw_cols
     raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
@@ -962,6 +970,16 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
             )
         except Exception as e:
             print(f"  WARNING: failed to save baseband segment: {e}")
+
+    if plot_output_dir and pulse_data_list:
+        try:
+            from pulse_plotter import plot_pulses_for_hdulist
+            plot_pulses_for_hdulist(
+                raw_out, corr_out, pulse_data_list, plot_output_dir,
+                src, tel, file_counter, version,
+            )
+        except Exception as e:
+            print(f"  WARNING: failed to plot pulse waterfalls: {e}")
 
     if pulse_collector is not None:
         pulse_collector.extend(pulse_data_list)
@@ -1048,6 +1066,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     csv_output_path=None,
                     output_raw_psrfits_dir=None,
                     output_corrected_psrfits_dir=None,
+                    plot_output_dir=None,
                     # ------------- v2 params ----------------
                     cleanup_every_n_hdulists=50):
     """Integrated VDIF -> DM correction -> pulse detection -> CSV pipeline (v2)."""
@@ -1211,6 +1230,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                             source_name_for_file=source_name,
                             telescope_for_file=telescope,
                             version_for_file=version,
+                            plot_output_dir=plot_output_dir,
                         )
 
                         # v2 L2: del the big lists, then re-create empty ones
@@ -1427,6 +1447,7 @@ if __name__ == "__main__":
         csv_output_path=params['csv_output_path'],
         output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
         output_corrected_psrfits_dir=params['output_corrected_psrfits_dir'],
+        plot_output_dir=params.get('plot_output_dir') or None,
         cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
     )
 
