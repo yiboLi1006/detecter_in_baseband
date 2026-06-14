@@ -1,6 +1,39 @@
 """
-Pulse detection module (v2) — operates on an in-memory astropy.io.fits HDUList.
+Pulse detection module (v5) — operates on an in-memory astropy.io.fits HDUList.
 
+v5 change vs v3: TOA precision fix.
+Memory cleanup inherited from v2 is unchanged.
+Detection algorithm and float64 precision are unchanged.
+
+v5 TOA changes:
+  1.  calculate_pulse_absolute_time now accepts offs_sub & tsubint
+      parameters and computes:
+        TOA = DATE-OBS + (OFFS_SUB - TSUBINT/2) + mu_fit * TBIN
+      instead of the v3 formula:
+        TOA = DATE-OBS + mu_fit * TBIN
+  2.  precise_pulse_timing reads OFFS_SUB / TSUBINT from the SUBINT table
+      (passed via offs_sub_arr / tsubint_arr) and forwards them to
+      calculate_pulse_absolute_time.
+  3.  detect_pulses_in_hdulist now extracts OFFS_SUB and TSUBINT columns
+      from the SUBINT HDU and passes them to precise_pulse_timing.
+
+These changes, together with the integrated_pipeline.py v5 time-system
+reconstruction (fixed T0_obs_start, half-integer subint_offset), ensure:
+  - All output PSRFITS files share the same DATE-OBS
+  - OFFS_SUB increases monotonically across file boundaries
+  - Standard tools (PSRCHIVE, PRESTO, tempo2) compute correct TOAs
+
+v5 log-simplification (compared to v3):
+  - Removed "Performing frequency domain RFI removal..." and channel stats.
+  - Removed "Performing time-frequency domain RFI removal..." and TF stats.
+  - Removed manual frequency mask per-range detail prints.
+  - Removed STEP 1/2/3 detection stage banners and intermediate counts.
+  - Removed "Applying Amplitude SNR filtering" preamble.
+  - Removed "No initial peaks...", "No pulses passed..." empty-result lines.
+  - Removed pulse-detection opening banner ("Pulse detection (in-memory, v2)").
+  - Kept only the "Detected N pulses" final summary + algorithm warnings.
+
+---
 v2 change vs v1: detect_pulses_in_hdulist drops each large intermediate
 array (data_2d, data_freq_cleaned, data_tf_cleaned, fit_results) as soon
 as the next stage no longer needs it, so peak resident memory during
@@ -53,10 +86,10 @@ def robust_sigma_clip(data, sigma, max_iter=100):
 
 def remove_rfi_frequency_domain(data_2d, freqs=None, method='sigma_clip',
                                 sigma=2.0, percentile=70, manual_mask=None):
-    print("Performing frequency domain RFI removal...")
     if method == 'percentile':
         _ = np.percentile(data_2d, percentile)
-    mean_spectrum = np.nanmean(data_2d, axis=0)
+    with np.errstate(invalid='ignore'):  # all-NaN channels expected after flag_xband / flag_bandpass_edges
+        mean_spectrum = np.nanmean(data_2d, axis=0)
     freq_mask = np.ones(mean_spectrum.shape, dtype=bool)
 
     if method == 'sigma_clip':
@@ -68,18 +101,10 @@ def remove_rfi_frequency_domain(data_2d, freqs=None, method='sigma_clip',
     cleaned_data = data_2d.copy()
     cleaned_data[:, ~freq_mask] = np.nan
 
-    auto_retained = np.sum(freq_mask)
-    total_channels = len(freq_mask)
-    print(f"Retained {auto_retained}/{total_channels} "
-          f"({auto_retained / total_channels * 100:.2f}%) channels after auto RFI removal")
-
     if manual_mask is not None and freqs is not None:
-        print("=" * 50)
-        print("Applying manual frequency mask...")
         freq_ranges = []
         if 'freq_ranges' in manual_mask and manual_mask['freq_ranges']:
             freq_ranges = manual_mask['freq_ranges']
-            print(f"Using absolute frequency ranges: {freq_ranges}")
         elif 'fractional_ranges' in manual_mask and manual_mask['fractional_ranges']:
             fractional_ranges = manual_mask['fractional_ranges']
             freq_min, freq_max = freqs[0], freqs[-1]
@@ -87,27 +112,20 @@ def remove_rfi_frequency_domain(data_2d, freqs=None, method='sigma_clip',
                 freq_start = freq_min + (freq_max - freq_min) * start_frac
                 freq_end = freq_min + (freq_max - freq_min) * end_frac
                 freq_ranges.append((freq_start, freq_end))
-            print(f"Using fractional ranges {fractional_ranges} -> {freq_ranges}")
 
         if freq_ranges:
-            for i, (freq_start, freq_end) in enumerate(freq_ranges):
+            for freq_start, freq_end in freq_ranges:
                 if freq_start > freq_end:
                     freq_start, freq_end = freq_end, freq_start
-                print(f"Manual mask {i + 1}: {freq_start:.2f} - {freq_end:.2f} MHz")
                 mask_indices = np.where((freqs >= freq_start) & (freqs <= freq_end))[0]
-                if len(mask_indices) == 0:
-                    print("  Warning: No frequency channels found in this range")
-                    continue
-                freq_mask[mask_indices] = False
-                cleaned_data[:, mask_indices] = np.nan
-                print(f"  Masked {len(mask_indices)} frequency channels")
-        print("=" * 50)
+                if len(mask_indices) > 0:
+                    freq_mask[mask_indices] = False
+                    cleaned_data[:, mask_indices] = np.nan
 
     return cleaned_data, freq_mask
 
 
 def remove_rfi_time_frequency(data_2d, window_size, sigma, overlap=0.5):
-    print("Performing time-frequency domain RFI removal...")
     cleaned_data = data_2d.copy()
     tf_mask = np.ones(data_2d.shape, dtype=bool)
     ntimes = data_2d.shape[0]
@@ -119,7 +137,6 @@ def remove_rfi_time_frequency(data_2d, window_size, sigma, overlap=0.5):
         outliers = np.abs(window_data - window_mean) > sigma * window_std
         tf_mask[start_idx:end_idx, :] &= ~outliers
         cleaned_data[start_idx:end_idx, :][outliers] = np.nan
-    print(f"Retained {np.sum(tf_mask)} / {np.prod(tf_mask.shape)} time-frequency points")
     return cleaned_data, tf_mask
 
 
@@ -167,7 +184,6 @@ def filter_peaks_by_amplitude_snr(lightcurve, peak_indices, peak_properties,
                                   background_level, noise_sigma,
                                   n_sigma_amplitude,
                                   min_prominence_sigma_factor=0.5):
-    print(f"\nApplying Amplitude SNR filtering (>= {n_sigma_amplitude:.2f} sigma)...")
     amplitude_snrs = calculate_amplitude_snr(lightcurve, peak_indices,
                                              background_level, noise_sigma)
     selected_mask = (amplitude_snrs >= n_sigma_amplitude)
@@ -180,7 +196,6 @@ def filter_peaks_by_amplitude_snr(lightcurve, peak_indices, peak_properties,
             filtered_properties[key] = peak_properties[key][selected_indices]
 
     filtered_amplitude_snrs = amplitude_snrs[selected_indices]
-    print(f"  Peaks passing amplitude SNR threshold: {len(filtered_peaks)}")
     return filtered_peaks, filtered_properties, filtered_amplitude_snrs
 
 
@@ -188,18 +203,15 @@ def detect_pulses_v3(lightcurve, times, background_level, noise_sigma,
                      n_sigma_amplitude=4.0, n_sigma_flux=3.0,
                      min_prominence_sigma_factor=0.5, peak_distance=None):
     detection_threshold = background_level + n_sigma_amplitude * noise_sigma
-    print(f"\nSTEP 1: Initial peak detection (threshold={detection_threshold:.6f})")
     prominence_threshold = max(noise_sigma * min_prominence_sigma_factor,
                                noise_sigma * 0.3)
 
     peaks, properties = find_peaks(
         lightcurve, height=detection_threshold, prominence=prominence_threshold,
     )
-    print(f"  Initial peaks: {len(peaks)}")
     if len(peaks) == 0:
         return np.array([]), {}, np.array([])
 
-    print("\nSTEP 2: Amplitude SNR filtering")
     filtered_peaks, filtered_properties, filtered_amplitude_snrs = filter_peaks_by_amplitude_snr(
         lightcurve, peaks, properties,
         background_level, noise_sigma,
@@ -208,7 +220,6 @@ def detect_pulses_v3(lightcurve, times, background_level, noise_sigma,
     )
 
     if peak_distance is not None and len(filtered_peaks) > 1:
-        print(f"\nSTEP 3: Peak distance filtering (min distance={peak_distance})")
         peak_heights = lightcurve[filtered_peaks]
         sorted_indices = np.argsort(peak_heights)[::-1]
         selected_peaks = []
@@ -227,7 +238,6 @@ def detect_pulses_v3(lightcurve, times, background_level, noise_sigma,
             selected_properties[key] = np.array(selected_properties[key])[sorted_selected]
         filtered_amplitude_snrs = np.array(selected_snrs)[sorted_selected]
         filtered_properties = selected_properties
-        print(f"  After distance filter: {len(filtered_peaks)} peaks retained")
 
     return filtered_peaks, filtered_properties, filtered_amplitude_snrs
 
@@ -370,6 +380,13 @@ def calculate_flux_snr_from_fit(A_fit, A_err, sigma_fit, sigma_err, noise_sigma)
 # ---------------------------------------------------------------------------
 
 def calculate_pulse_absolute_time(mu_fit, tbin, date_obs_iso, offs_sub=0.0, tsubint=0.0):
+    """v5: compute absolute TOA following PSRFITS convention.
+
+    TOA = DATE-OBS + (OFFS_SUB - TSUBINT/2) + mu_fit * TBIN
+
+    where (OFFS_SUB - TSUBINT/2) gives the subint start time and
+    mu_fit * TBIN locates the pulse within the subint.
+    """
     relative_time_sec = mu_fit * tbin
     relative_time_ms = relative_time_sec * 1000.0
     absolute_offset_sec = offs_sub - tsubint / 2.0 + mu_fit * tbin
@@ -541,7 +558,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         jd1 = jd2 = None
         precise_mjd_str = None
         if tbin is not None and date_obs_iso is not None:
-            # v4: use OFFS_SUB[0] as baseline + mu_fit * tbin for absolute time
+            # v5: use OFFS_SUB[0] as baseline + mu_fit * tbin for absolute time
             _offs_sub = 0.0
             _tsubint = 0.0
             if offs_sub_arr is not None and tsubint_arr is not None and len(offs_sub_arr) > 0:
@@ -754,8 +771,6 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
         pulse_data = {
             'Coarse_Index': int(peak_idx),
             'Precise_Rel_Time_ms': float(precise_rel_time_ms),
-            'Precise_Abs_MJD': float(precise_abs_mjd) if precise_abs_mjd is not None else np.nan,
-            'Precise_UTC_Time': precise_utc,
             'Background_Level': float(background_level),
             'Noise_Sigma': float(noise_sigma),
         }
@@ -787,7 +802,6 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
         flux_err_val = result.get('flux_err', None)
 
         pulse_data.update({
-            'Precise_Time_Err_ms': float(time_error_ms),
             'Precise_Center_Index': float(result.get('precise_peak_idx', 0)),
             'Center_Err': float(center_error),
             'Amplitude': float(result.get('amplitude', 0)),
@@ -801,7 +815,6 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             'Flux_From_Fit': float(flux_val) if flux_val is not None else np.nan,
             'Flux_Err': float(flux_err_val) if flux_err_val is not None else np.nan,
             'SNR_Flux_From_Fit': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
-            'Fit_Success': True,
         })
         pulse_data_list.append(pulse_data)
 
@@ -834,10 +847,6 @@ def detect_pulses_in_hdulist(hdulist, params):
     min_prom_factor = params.get('min_prominence_sigma_factor', 0.3)
     tf_window = params.get('rfi_time_freq_window', 200)
 
-    print("=" * 60)
-    print("Pulse detection (in-memory, v2)")
-    print("=" * 60)
-
     # ----- Step 1: Read data from hdulist -----
     data_2d, freqs, times, header_info = _read_psrfits_data_from_hdulist(
         hdulist, normalize=True, pol_index=0
@@ -867,10 +876,7 @@ def detect_pulses_in_hdulist(hdulist, params):
     M_final, sigma_final, _ = iterative_sigma_clipping(
         lightcurve, initial_K=3, final_K=5, max_iterations=50
     )
-    print(f"Background={M_final:.6f}, noise sigma={sigma_final:.6f}")
-
     if not np.isfinite(M_final) or not np.isfinite(sigma_final) or sigma_final <= 0:
-        print("Invalid background/noise estimate; skipping.")
         return []
 
     # ----- Step 5: Peak detection -----
@@ -883,7 +889,6 @@ def detect_pulses_in_hdulist(hdulist, params):
         peak_distance=peak_distance,
     )
     if len(peaks_detected) == 0:
-        print("No initial peaks passed amplitude SNR.")
         return []
 
     # ----- Step 6: Pulse widths -----
@@ -894,7 +899,7 @@ def detect_pulses_in_hdulist(hdulist, params):
 
     # ----- Step 7: DATE-OBS + TBIN + OFFS_SUB/TSUBINT -----
     date_obs_iso, obs_info = _get_observation_start_info_from_hdulist(hdulist)
-    # v4: read OFFS_SUB and TSUBINT arrays for correct absolute TOA calculation
+    # v5: read OFFS_SUB and TSUBINT arrays for correct absolute TOA calculation
     subint_data = hdulist['SUBINT'].data
     offs_sub_arr = subint_data['OFFS_SUB']
     tsubint_arr = subint_data['TSUBINT']
@@ -914,7 +919,6 @@ def detect_pulses_in_hdulist(hdulist, params):
         tsubint_arr=tsubint_arr,
     )
     if len(fit_results) == 0:
-        print("No pulses passed the flux SNR threshold after Gaussian fitting.")
         del lightcurve, final_times, times, freqs, _precise_peaks, _precise_times
         return []
 

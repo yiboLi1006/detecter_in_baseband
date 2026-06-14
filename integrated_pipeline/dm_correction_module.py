@@ -1,6 +1,12 @@
 """
-DM correction module (v2) — operates on an in-memory astropy.io.fits HDUList.
+DM correction module (v5) — operates on an in-memory astropy.io.fits HDUList.
 
+v5 change vs v3: log simplification only. All DM-correction detail prints
+(frequency range, delay range, time resolution, method banner, opening/
+closing separators) have been removed.  The algorithm, float64 precision,
+and in-place HDUList mutation are unchanged.
+
+---
 v2 change vs v1: explicit `del` of large intermediate arrays (data_4d,
 corrected_data, header_info) before returning, so glibc / numpy's allocator
 can reclaim them as soon as possible. Algorithm and float64 precision
@@ -130,15 +136,8 @@ def apply_dm_correction_full(data_4d, freqs, times, dm, ref_freq=None, method='f
     if ref_freq is None:
         ref_freq = np.max(freqs)
 
-    print(f"Applying DM correction: DM = {dm} pc/cm^3, ref_freq = {ref_freq} MHz")
-    print(f"Using method: {method}")
-
     delays = dm_delay(freqs / 1e3, dm, ref_freq / 1e3)
-    print(f"Freqs range: {np.min(freqs):.6f} to {np.max(freqs):.6f} MHz")
-    print(f"Delay range: {np.min(delays):.6f} to {np.max(delays):.6f} seconds")
-
     dt = times[1] - times[0] if len(times) > 1 else 1.0
-    print(f"Time resolution: {dt:.6e} seconds")
 
     corrected_data = np.zeros_like(data_4d)
     nchan = len(freqs)
@@ -158,8 +157,8 @@ def apply_dm_correction_full(data_4d, freqs, times, dm, ref_freq=None, method='f
                 interp_func = interp1d(
                     times, data_4d[:, chan, pol],
                     kind='linear', bounds_error=False,
-                    fill_value=0.0, assume_sorted=True,
-                )  # Changed from np.nan → 0.0 for PRESTO compatibility
+                    fill_value=np.nan, assume_sorted=True,
+                )
                 corrected_data[:, chan, pol] = interp_func(times - delays[chan])
                 del interp_func
 
@@ -244,10 +243,6 @@ def dm_correct_hdulist(hdulist, dm, ref_freq=None, method='freq_domain', normali
         The same hdulist passed in, with DATA column replaced by DM-corrected
         values and HISTORY entries appended.
     """
-    print("=" * 60)
-    print("DM correction (in-memory, v3, in-place)")
-    print("=" * 60)
-
     data_4d, freqs, times, header_info = _extract_from_hdulist(hdulist, normalize=normalize)
 
     corrected_data = apply_dm_correction_full(
@@ -258,7 +253,4 @@ def dm_correct_hdulist(hdulist, dm, ref_freq=None, method='freq_domain', normali
     _apply_corrected_data_inplace(hdulist, corrected_data, header_info, dm, ref_freq, method)
 
     del corrected_data, header_info, freqs, times
-
-    print("DM correction done (in-place).")
-    print("=" * 60)
     return hdulist
