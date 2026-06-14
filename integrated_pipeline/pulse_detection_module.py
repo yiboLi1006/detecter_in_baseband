@@ -369,12 +369,12 @@ def calculate_flux_snr_from_fit(A_fit, A_err, sigma_fit, sigma_err, noise_sigma)
 # v4.0 TOA helpers (verbatim)
 # ---------------------------------------------------------------------------
 
-def calculate_pulse_absolute_time(mu_fit, tbin, date_obs_iso):
+def calculate_pulse_absolute_time(mu_fit, tbin, date_obs_iso, offs_sub=0.0, tsubint=0.0):
     relative_time_sec = mu_fit * tbin
     relative_time_ms = relative_time_sec * 1000.0
+    absolute_offset_sec = offs_sub - tsubint / 2.0 + mu_fit * tbin
     t0 = Time(date_obs_iso, format='isot', scale='utc')
-    offset = relative_time_sec * u.s
-    absolute_time = t0 + offset
+    absolute_time = t0 + absolute_offset_sec * u.s
     try:
         absolute_time.precision = 9
     except Exception:
@@ -436,7 +436,8 @@ def get_coarse_time_precision(time_resolution):
 def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_info,
                          time_resolution, method='base', fit_window_factor=3.0,
                          global_noise_sigma=None, amplitude_snrs=None,
-                         n_sigma_flux=3.0, tbin=None, date_obs_iso=None):
+                         n_sigma_flux=3.0, tbin=None, date_obs_iso=None,
+                         offs_sub_arr=None, tsubint_arr=None):
     precise_peaks = []
     precise_times = []
     fit_results = []
@@ -540,9 +541,15 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         jd1 = jd2 = None
         precise_mjd_str = None
         if tbin is not None and date_obs_iso is not None:
+            # v4: use OFFS_SUB[0] as baseline + mu_fit * tbin for absolute time
+            _offs_sub = 0.0
+            _tsubint = 0.0
+            if offs_sub_arr is not None and tsubint_arr is not None and len(offs_sub_arr) > 0:
+                _offs_sub = float(offs_sub_arr[0])
+                _tsubint = float(tsubint_arr[0])
             (relative_time_sec, relative_time_ms, absolute_time_obj,
              jd1, jd2, absolute_utc) = calculate_pulse_absolute_time(
-                mu_fit, tbin, date_obs_iso)
+                mu_fit, tbin, date_obs_iso, offs_sub=_offs_sub, tsubint=_tsubint)
             absolute_mjd = absolute_time_obj.mjd
             precise_mjd_str = _compose_mjd_string_from_jd_parts(jd1, jd2, digits=15)
         else:
@@ -885,8 +892,12 @@ def detect_pulses_in_hdulist(hdulist, params):
         M_final + n_sigma_amplitude * sigma_final, method='base'
     )
 
-    # ----- Step 7: DATE-OBS + TBIN -----
+    # ----- Step 7: DATE-OBS + TBIN + OFFS_SUB/TSUBINT -----
     date_obs_iso, obs_info = _get_observation_start_info_from_hdulist(hdulist)
+    # v4: read OFFS_SUB and TSUBINT arrays for correct absolute TOA calculation
+    subint_data = hdulist['SUBINT'].data
+    offs_sub_arr = subint_data['OFFS_SUB']
+    tsubint_arr = subint_data['TSUBINT']
 
     # ----- Step 8: Precise pulse timing -----
     time_resolution = (final_times[1] - final_times[0]
@@ -899,6 +910,8 @@ def detect_pulses_in_hdulist(hdulist, params):
         n_sigma_flux=n_sigma_flux,
         tbin=obs_info['tbin'],
         date_obs_iso=date_obs_iso,
+        offs_sub_arr=offs_sub_arr,
+        tsubint_arr=tsubint_arr,
     )
     if len(fit_results) == 0:
         print("No pulses passed the flux SNR threshold after Gaussian fitting.")

@@ -653,12 +653,12 @@ def Process_vdif_data_multiband(data, reduction_factor, nchans, usb='U', usb_lis
 # Primary HDU / table column construction  (verbatim from v16)
 # =========================================================================
 
-def create_primary_header(start_time, tsamp, nsamples_per_subint, n_subints,
+def create_primary_header(obs_start_time, tsamp, nsamples_per_subint, n_subints,
                           center_freq, chan_bw, nchans, dm, source_name,
-                          telescope, coord, file_counter, global_offset=0.0):
+                          telescope, coord, file_counter):
     primary_hdu = fits.PrimaryHDU()
     header = primary_hdu.header
-    actual_start_time = start_time + global_offset * u.second
+    actual_start_time = obs_start_time
 
     ra_str = coord.ra.to_string(unit=u.hourangle, sep=':', precision=2)
     dec_str = coord.dec.to_string(unit=u.degree, sep=':', precision=1)
@@ -727,7 +727,8 @@ def create_primary_header(start_time, tsamp, nsamples_per_subint, n_subints,
 
 def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
                          center_freq, nchans, chan_bw, coord, file_counter,
-                         continuous_freqs=None, global_offset=0.0):
+                         continuous_freqs=None, global_offset=0.0,
+                         data_format='E'):
     n_subints = len(subint_data_list)
     first_subint_data = subint_data_list[0]
     nsamples_per_subint = first_subint_data.shape[1]
@@ -760,10 +761,18 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
     dat_scl = np.ones(actual_nchans, dtype=np.float32)
 
     total_elements_per_subint = 1 * actual_nchans * 1 * nsamples_per_subint
-    data_arrays = [
-        sd.reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
-        for sd in subint_data_list
-    ]
+    if data_format == 'B':
+        # Convert to uint8: clip float32 values to [0, 255], round, cast
+        data_arrays = [
+            np.clip(np.round(sd), 0, 255).astype(np.uint8)
+            .reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
+            for sd in subint_data_list
+        ]
+    else:
+        data_arrays = [
+            sd.reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
+            for sd in subint_data_list
+        ]
     data_column = np.array(data_arrays)
 
     cols = [
@@ -787,7 +796,7 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
                     dim=f'({actual_nchans})', array=[dat_offs] * n_subints),
         fits.Column(name='DAT_SCL', format=f'{actual_nchans}E',
                     dim=f'({actual_nchans})', array=[dat_scl] * n_subints),
-        fits.Column(name='DATA', format=f'{total_elements_per_subint}E',
+        fits.Column(name='DATA', format=f'{total_elements_per_subint}{data_format}',
                     dim=f'(1, {actual_nchans}, 1, {nsamples_per_subint})',
                     unit='UNCALIB', array=data_column),
         fits.Column(name='INDEXVAL', format='1D', array=indexval_arr),
@@ -806,7 +815,8 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         tsamp, center_freq, nband, chan_bw,
                                         nchans, dm, source_name, telescope,
                                         coord, output_file, file_counter,
-                                        continuous_freqs=None, global_offset=0.0,
+                                        continuous_freqs=None,
+                                        obs_start_time=None,
                                         # ---------- v1 params ----------
                                         dm_value=None, dm_ref_freq=None,
                                         detection_params=None,
@@ -833,13 +843,14 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
 
     cols, nsamples_per_subint, n_subints, actual_nchans = create_table_columns(
         subint_data_list, subint_offsets_list, tsamp, center_freq,
-        nchans, chan_bw, coord, file_counter, continuous_freqs, global_offset,
+        nchans, chan_bw, coord, file_counter, continuous_freqs, 0.0,
+        data_format='B',
     )
 
     primary_hdu = create_primary_header(
-        start_time, tsamp, nsamples_per_subint, n_subints,
+        obs_start_time, tsamp, nsamples_per_subint, n_subints,
         center_freq, chan_bw, actual_nchans, dm, source_name, telescope,
-        coord, file_counter, global_offset,
+        coord, file_counter,
     )
 
     table_hdu = fits.BinTableHDU.from_columns(cols, name='SUBINT')
@@ -853,7 +864,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th['NBIN'] = 1
     th['NBIN_PRD'] = 0
     th['PHS_OFFS'] = 0.0
-    th['NBITS'] = 8
+    th['NBITS'] = 8  # uint8 (format='B' in DATA column)
     th['NSUBOFFS'] = file_counter * n_subints
     th['NCHAN'] = actual_nchans
     th['CHAN_BW'] = chan_bw
@@ -914,16 +925,22 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     print(f"  -> corrected PSRFITS: {corr_out}")
 
     # v3: rebuild raw hdulist from the still-available subint_data_list.
+    # Convert to uint8 for PSRFITS compliance (PRESTO compatibility).
     # This path is rare (only when pulses are detected) so the rebuild cost
     # is acceptable; the steady-state non-detection path now never copies.
+    raw_subint_data_list = [
+        np.clip(np.round(sd), 0, 255).astype(np.uint8)
+        for sd in subint_data_list
+    ]
     raw_cols, raw_nsamples, raw_nsubints, raw_nchans = create_table_columns(
-        subint_data_list, subint_offsets_list, tsamp, center_freq,
-        nchans, chan_bw, coord, file_counter, continuous_freqs, global_offset,
+        raw_subint_data_list, subint_offsets_list, tsamp, center_freq,
+        nchans, chan_bw, coord, file_counter, continuous_freqs, 0.0,
+        data_format='B',
     )
     raw_primary = create_primary_header(
-        start_time, tsamp, raw_nsamples, raw_nsubints,
-        center_freq, chan_bw, raw_nchans, dm, source_name, telescope,
-        coord, file_counter, global_offset,
+        obs_start_time, tsamp, raw_nsamples, raw_nsubints,
+        center_freq, chan_bw, raw_nchans, 0.0, source_name, telescope,
+        coord, file_counter,
     )
     raw_table = fits.BinTableHDU.from_columns(raw_cols, name='SUBINT')
     rth = raw_table.header
@@ -936,7 +953,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['NBIN'] = 1
     rth['NBIN_PRD'] = 0
     rth['PHS_OFFS'] = 0.0
-    rth['NBITS'] = 8
+    rth['NBITS'] = 8  # uint8 (format='B' in DATA column)
     rth['NSUBOFFS'] = file_counter * raw_nsubints
     rth['NCHAN'] = raw_nchans
     rth['CHAN_BW'] = chan_bw
@@ -947,7 +964,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['DM'] = dm_value if dm_value is not None else dm
     rth['REFFREQ'] = dm_ref_freq if dm_ref_freq is not None else center_freq
     raw_hdulist = fits.HDUList([raw_primary, raw_table])
-    del raw_cols
+    del raw_cols, raw_subint_data_list
     raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
     print(f"  -> raw PSRFITS: {raw_out}")
 
@@ -1159,6 +1176,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
         subint_offsets_list = []
         subint_chunk_ranges = []
 
+        T0_obs_start = None  # v4: capture observation start time (fixed for all files)
+
         for chunk_start in range(start_sample, start_sample + total_samples, chunk_size):
             end_sample = min(chunk_start + chunk_size, start_sample + total_samples)
             samples_to_read = end_sample - chunk_start
@@ -1187,7 +1206,9 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
                 file_obj.seek(chunk_start)
                 start_time_chunk = file_obj.tell(unit='time')
-                subint_offset = current_subint * tsamp * processed_data.shape[1]
+                if T0_obs_start is None:
+                    T0_obs_start = start_time_chunk  # v4: fixed observation start time
+                subint_offset = (current_subint + 0.5) * tsamp * processed_data.shape[1]
 
                 subint_data_list.append(processed_data)
                 subint_times_list.append(start_time_chunk)
@@ -1214,7 +1235,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                             source_name, telescope, coord,
                             output_file=None, file_counter=file_counter,
                             continuous_freqs=continuous_freqs,
-                            global_offset=global_offset,
+                            obs_start_time=T0_obs_start,
                             dm_value=dm_value, dm_ref_freq=dm_ref_freq,
                             detection_params=detection_params,
                             output_raw_psrfits_dir=output_raw_psrfits_dir,

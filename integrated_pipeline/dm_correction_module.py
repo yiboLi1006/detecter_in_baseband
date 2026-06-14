@@ -158,8 +158,8 @@ def apply_dm_correction_full(data_4d, freqs, times, dm, ref_freq=None, method='f
                 interp_func = interp1d(
                     times, data_4d[:, chan, pol],
                     kind='linear', bounds_error=False,
-                    fill_value=np.nan, assume_sorted=True,
-                )
+                    fill_value=0.0, assume_sorted=True,
+                )  # Changed from np.nan → 0.0 for PRESTO compatibility
                 corrected_data[:, chan, pol] = interp_func(times - delays[chan])
                 del interp_func
 
