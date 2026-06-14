@@ -1,28 +1,47 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline.
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v2).
 
-Based verbatim on former_script/vdif2psrfits/vdif2psrfits_v16.py. The only
-changes are:
+v2 change vs v1: aggressive memory cleanup. The detection / DM algorithms
+and float64 precision are unchanged.
 
-  1. read_config() parses additional [dm_correction], [detection],
-     [detection_manual_mask], [integrated_output] sections.
-  2. write_psrfits_file_multiple_subints() does NOT unconditionally write
-     the hdulist to disk. Instead it:
-        a. Runs dm_correct_hdulist() on the in-memory hdulist.
-        b. Runs detect_pulses_in_hdulist() on the corrected hdulist.
-        c. Only when pulses are detected, writes the raw + corrected
-           hdulists to their respective output directories AND copies the
-           VDIF byte range covering this hdulist to a frame-aligned
-           segment file. Otherwise nothing is written.
-        d. Appends detected pulse data dicts to a shared pulse collector.
-  3. vdif_to_psrfits() tracks each chunk's (start_sample, sample_count)
-     in lists parallel to subint_data_list so we can compute the VDIF
-     segment range belonging to each emitted hdulist. At the very end it
-     writes the accumulated pulse_collector to a timestamped CSV.
+Cleanup layers added in v2:
+  L1 (per chunk):   del raw_data, chunk_data, processed_data right after
+                    they have been handed off to subint_data_list.
+  L2 (per hdulist): write_psrfits_file_multiple_subints does `del` of the
+                    in-memory hdulist + corrected_hdulist + pulse_data_list
+                    before returning; the main loop also `del`s the four
+                    subint_*_list / subint_chunk_ranges lists before
+                    re-creating empty replacements.
+  L3 (every N):     after every cleanup_every_n_hdulists writes (configured
+                    in [performance] cleanup_every_n_hdulists, default 50),
+                    run gc.collect() + libc.malloc_trim(0). The latter is a
+                    no-op on non-glibc platforms.
 
-VDIF reading / FFT / channelization / bandpass+flux calibration /
-PSRFITS construction logic is preserved unchanged.
+v2 Round 3 additions (R2 measurements still showed linear growth; R3
+strengthens cleanup cadence and adds an opt-in tracemalloc diagnostic):
+  R3a: gc.collect() + libc.malloc_trim(0) now run after EVERY hdulist
+       (not every cleanup_every_n_hdulists). Per-hdulist cost is sub-second
+       and makes any sawtooth pattern visible immediately in mem_log.
+  R3b: per-hdulist psutil RSS log (was: only on cleanup boundary).
+  R3c: tracemalloc diagnostic, opt-in via env TRACEMALLOC_ENABLED=1.
+       When enabled, every hdulist prints the top-10 allocation-growth
+       call sites since the previous hdulist. Use this to pinpoint which
+       file:line is accumulating bytes between hdulists.
+  R3d: cleanup_every_n_hdulists now controls ONLY the baseband reader
+       close+reopen cycle (no longer also gates the gc/trim/log).
+
+Recommended runtime knob (no code change required):
+  Long-running numpy/scipy workloads on Linux often appear to "leak"
+  memory due to glibc malloc multi-arena fragmentation. Two well-known
+  cures, in increasing order of effectiveness:
+    1) Run the script with `MALLOC_ARENA_MAX=2 python ...` -- caps arenas.
+    2) LD_PRELOAD jemalloc:
+       `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 python ...`
+  These don't fix Python-side reference leaks but eliminate most of the
+  "RSS keeps growing forever" symptom for numerics-heavy long-jobs.
+
+Set cleanup_every_n_hdulists = 0 in the ini to disable R2a (reader recycle).
 """
 
 import os
@@ -32,6 +51,8 @@ import math
 import datetime
 import warnings
 import configparser
+import gc
+import ctypes
 
 import numpy as np
 import pandas as pd
@@ -43,7 +64,6 @@ from astropy.coordinates import SkyCoord
 from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
 
-# --- New modules introduced for the integrated pipeline -----------------
 from dm_correction_module import dm_correct_hdulist
 from pulse_detection_module import detect_pulses_in_hdulist
 from vdif_segment_writer import save_baseband_segment
@@ -52,11 +72,109 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # =========================================================================
+# v2: heap cleanup helper
+# =========================================================================
+
+_LIBC = None
+
+try:
+    import psutil as _psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _psutil = None
+    _HAS_PSUTIL = False
+
+# v2 R3: optional tracemalloc diagnostic.
+# Enable by setting environment variable TRACEMALLOC_ENABLED=1 before launch.
+_TRACEMALLOC_ENABLED = os.environ.get('TRACEMALLOC_ENABLED', '0') == '1'
+if _TRACEMALLOC_ENABLED:
+    try:
+        import tracemalloc as _tracemalloc
+    except ImportError:
+        _tracemalloc = None
+        _TRACEMALLOC_ENABLED = False
+else:
+    _tracemalloc = None
+
+
+def _trim_malloc():
+    """Release fragmented glibc heap back to the OS (Linux only; no-op elsewhere)."""
+    global _LIBC
+    try:
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        _LIBC.malloc_trim(0)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
+def _log_rss(tag=''):
+    """Print this process RSS in GiB if psutil is available; otherwise silent."""
+    if not _HAS_PSUTIL:
+        return
+    try:
+        rss_gib = _psutil.Process().memory_info().rss / (1 << 30)
+        print(f"### [memory] {tag} RSS = {rss_gib:.3f} GiB")
+    except Exception:
+        pass
+
+
+def _dump_tracemalloc_top(cur_snap, ref_snap, top_n, tag, label):
+    """Print top-N (file:lineno) blocks by size_diff vs ref_snap."""
+    if cur_snap is None or ref_snap is None:
+        return
+    try:
+        stats = cur_snap.compare_to(ref_snap, 'lineno')
+    except Exception as e:
+        print(f"### [tracemalloc] {tag}: compare_to failed: {e}")
+        return
+    print(f"### [tracemalloc] {tag}: top {top_n} growth {label}:")
+    for i, stat in enumerate(stats[:top_n]):
+        diff_kib = stat.size_diff / 1024.0
+        cur_kib = stat.size / 1024.0
+        try:
+            frame = stat.traceback[0]
+            site = f"{frame.filename}:{frame.lineno}"
+        except Exception:
+            site = "<unknown>"
+        print(f"  #{i+1:2d} {diff_kib:+10.1f} KiB net  "
+              f"({stat.count_diff:+d} blocks, cur={cur_kib:.1f} KiB)  {site}")
+        try:
+            for line in stat.traceback.format():
+                print(f"        {line}")
+        except Exception:
+            pass
+
+
+def _tracemalloc_diff(prev_snapshot, tag=''):
+    """If tracemalloc is enabled, print top-N allocation growth since prev_snapshot.
+
+    Delegates to _dump_tracemalloc_top for richer output (file:lineno + full
+    traceback frames per top stat).
+
+    Returns the new snapshot (or None if tracemalloc disabled).
+    """
+    if not _TRACEMALLOC_ENABLED or _tracemalloc is None:
+        return None
+    try:
+        snap = _tracemalloc.take_snapshot()
+        if prev_snapshot is not None:
+            _dump_tracemalloc_top(snap, prev_snapshot, 10, tag,
+                                  "since last snapshot")
+        else:
+            print(f"### [tracemalloc] baseline snapshot taken ({tag})")
+        return snap
+    except Exception as e:
+        print(f"### [tracemalloc] error: {e}")
+        return prev_snapshot
+
+
+# =========================================================================
 # Configuration
 # =========================================================================
 
 def _parse_freq_mask_ranges(raw_str):
-    """Parse multi-line 'a,b' entries into [(float, float), ...]."""
     ranges = []
     if not raw_str:
         return ranges
@@ -76,15 +194,14 @@ def _parse_freq_mask_ranges(raw_str):
 
 
 def read_config(config_file):
-    """Read all configuration parameters (extended for integrated pipeline)."""
+    """Read all configuration parameters (extended for integrated pipeline v2)."""
     config = configparser.ConfigParser()
     config.read(config_file)
 
     params = {}
 
     # -- paths --
-    params['output_dir'] = config.get('paths', 'output_dir',
-                                      fallback='./presto_fits')
+    params['output_dir'] = config.get('paths', 'output_dir', fallback='./presto_fits')
     params['vdif_file'] = config.get('paths', 'vdif_file',
                                      fallback='./ywwu_data/p51015_km_no0009.vdif')
     params['data_format'] = config.get('paths', 'data_format',
@@ -101,8 +218,7 @@ def read_config(config_file):
                                        fallback='32*u.MHz').strip()
 
     # -- output --
-    params['max_subints_per_file'] = config.getint('output', 'max_subints_per_file',
-                                                   fallback=2)
+    params['max_subints_per_file'] = config.getint('output', 'max_subints_per_file', fallback=2)
     params['max_files'] = config.getint('output', 'max_files', fallback=1)
     params['version'] = config.getint('output', 'version', fallback=4)
 
@@ -132,7 +248,7 @@ def read_config(config_file):
     params['subbands'] = [int(x.strip()) for x in subbands_str.split(',')]
 
     if params['usb_list'] is not None and len(params['usb_list']) != len(params['subbands']):
-        print(f"Warning: usb list length != subbands length. Defaulting to single USB value.")
+        print("Warning: usb list length != subbands length. Defaulting to single USB value.")
         params['usb'] = params['usb_list'][0]
         params['usb_list'] = None
 
@@ -144,7 +260,7 @@ def read_config(config_file):
         params['subband_centers'] = [float(x.strip())
                                      for x in subband_centers_str.split(',')]
         if len(params['subband_centers']) != len(params['subbands']):
-            print(f"Warning: subband_centers length mismatch; disabling.")
+            print("Warning: subband_centers length mismatch; disabling.")
             params['subband_centers'] = None
     else:
         params['subband_centers'] = None
@@ -154,8 +270,7 @@ def read_config(config_file):
     params['reduction_factor'] = config.getint('processing', 'reduction_factor',
                                                fallback=512 * 32)
     params['nchans'] = config.getint('processing', 'nchans', fallback=512)
-    params['calib_bandpass'] = config.getboolean('processing', 'calib_bandpass',
-                                                 fallback=True)
+    params['calib_bandpass'] = config.getboolean('processing', 'calib_bandpass', fallback=True)
     flag_band_edge_str = config.get('processing', 'flag_band_edge', fallback='2')
     try:
         params['flag_band_edge'] = int(flag_band_edge_str.strip())
@@ -169,18 +284,15 @@ def read_config(config_file):
     if config.has_section('dm_correction'):
         ref_freq_str = config.get('dm_correction', 'ref_freq', fallback='').strip()
     if ref_freq_str == '':
-        params['dm_ref_freq'] = None  # fall back to center_freq later
+        params['dm_ref_freq'] = None
     else:
         params['dm_ref_freq'] = float(ref_freq_str)
 
     # -- detection --
     if config.has_section('detection'):
-        params['amp_snr_threshold'] = config.getfloat(
-            'detection', 'amp_snr_threshold', fallback=4.0)
-        params['flux_snr_threshold'] = config.getfloat(
-            'detection', 'flux_snr_threshold', fallback=4.0)
-        params['peak_distance'] = config.getint(
-            'detection', 'peak_distance', fallback=5000)
+        params['amp_snr_threshold'] = config.getfloat('detection', 'amp_snr_threshold', fallback=4.0)
+        params['flux_snr_threshold'] = config.getfloat('detection', 'flux_snr_threshold', fallback=4.0)
+        params['peak_distance'] = config.getint('detection', 'peak_distance', fallback=5000)
         params['sigma_remove_rfi_frequency'] = config.getfloat(
             'detection', 'sigma_remove_rfi_frequency', fallback=5.0)
         params['sigma_remove_rfi_time_frequency'] = config.getfloat(
@@ -201,21 +313,25 @@ def read_config(config_file):
 
     # -- integrated_output --
     if config.has_section('integrated_output'):
-        params['csv_output_path'] = config.get('integrated_output',
-                                               'csv_output_path',
+        params['csv_output_path'] = config.get('integrated_output', 'csv_output_path',
                                                fallback='./pulse_csv_results')
         params['output_raw_psrfits_dir'] = config.get('integrated_output',
                                                       'output_raw_psrfits_dir',
                                                       fallback='./pulse_psrfits_raw')
-        params['output_corrected_psrfits_dir'] = config.get(
-            'integrated_output',
-            'output_corrected_psrfits_dir',
-            fallback='./pulse_psrfits_corrected',
-        )
+        params['output_corrected_psrfits_dir'] = config.get('integrated_output',
+                                                            'output_corrected_psrfits_dir',
+                                                            fallback='./pulse_psrfits_corrected')
     else:
         params['csv_output_path'] = './pulse_csv_results'
         params['output_raw_psrfits_dir'] = './pulse_psrfits_raw'
         params['output_corrected_psrfits_dir'] = './pulse_psrfits_corrected'
+
+    # -- performance (v2) --
+    if config.has_section('performance'):
+        params['cleanup_every_n_hdulists'] = config.getint(
+            'performance', 'cleanup_every_n_hdulists', fallback=50)
+    else:
+        params['cleanup_every_n_hdulists'] = 50
 
     return params
 
@@ -398,6 +514,7 @@ def channelize_ts_batch(ts, freq_num=4096, usb='U', flag_edge_channels=2,
         positive_spectra = np.abs(spectra[:, :, :freq_num])
     else:
         positive_spectra = np.abs(spectra[:, :, freq_num:])
+    del spectra, reshape_ts  # v2: free FFT temporaries promptly
     positive_spectra = positive_spectra.transpose(0, 2, 1)
     if flag_edge_channels > 0:
         positive_spectra = flag_bandpass_edges(positive_spectra,
@@ -432,6 +549,7 @@ def channelize_ts_batch_per_subband(ts, freq_num=4096, usb_list=None,
             positive_spectra[subband_idx] = np.abs(spectra[subband_idx, :, :freq_num]).T
         else:
             positive_spectra[subband_idx] = np.abs(spectra[subband_idx, :, freq_num:]).T
+    del spectra, reshape_ts  # v2: free FFT temporaries promptly
     if flag_edge_channels > 0:
         positive_spectra = flag_bandpass_edges(positive_spectra,
                                                edge_channels=flag_edge_channels)
@@ -676,8 +794,8 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
 
 
 # =========================================================================
-# *** MODIFIED ***   write hdulist, run DM correction + pulse detection,
-# only write to disk when pulses are detected.
+# *** MODIFIED in v2 ***  hdulist write with conditional disk output AND
+# explicit del of all heavy locals before returning.
 # =========================================================================
 
 def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
@@ -686,7 +804,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         nchans, dm, source_name, telescope,
                                         coord, output_file, file_counter,
                                         continuous_freqs=None, global_offset=0.0,
-                                        # ---------- New params ----------
+                                        # ---------- v1 params ----------
                                         dm_value=None, dm_ref_freq=None,
                                         detection_params=None,
                                         output_raw_psrfits_dir=None,
@@ -702,10 +820,6 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         source_name_for_file=None,
                                         telescope_for_file=None,
                                         version_for_file=0):
-    """
-    Build the hdulist exactly as v16 does, then conditionally save it to disk:
-    only when detect_pulses_in_hdulist() reports a non-empty result.
-    """
     n_subints = len(subint_data_list)
     if n_subints == 0:
         print("No subint data to write")
@@ -744,29 +858,35 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th['EXTVER'] = 1
     th['TDIM16'] = f'(1,{actual_nchans},1,{nsamples_per_subint})'
 
-    # ===== This is the new pipeline insertion point =====
     hdulist = fits.HDUList([primary_hdu, table_hdu])
+    del cols  # v2: column list no longer needed after BinTable is built
 
-    # ① DM correction (in memory)
     print("\n" + ">" * 30 + f" hdulist #{file_counter}: DM correction " + "<" * 30)
-    corrected_hdulist = dm_correct_hdulist(
+    # v3: DM correction is now IN-PLACE on `hdulist`. After this call,
+    # `hdulist` carries the DM-corrected DATA column. We deliberately no
+    # longer hold a separate corrected_hdulist — that doubled the SUBINT
+    # buffer and was the source of the per-hdulist 213 MiB leak diagnosed
+    # via tracemalloc (astropy/io/fits/fitsrec.py:597, FITS_rec.copy()).
+    dm_correct_hdulist(
         hdulist, dm=dm_value,
         ref_freq=dm_ref_freq if dm_ref_freq is not None else center_freq,
-        method='freq_domain',
-        normalize=True,
+        method='freq_domain', normalize=True,
     )
 
-    # ② Pulse detection on the DM-corrected hdulist
     print(">" * 30 + f" hdulist #{file_counter}: pulse detection " + "<" * 30)
-    pulse_data_list = detect_pulses_in_hdulist(corrected_hdulist, detection_params)
+    pulse_data_list = detect_pulses_in_hdulist(hdulist, detection_params)
 
     if not pulse_data_list:
         print(f"hdulist #{file_counter}: no pulses detected -> nothing written.")
+        try:
+            hdulist.close()
+        except Exception:
+            pass
+        del hdulist, pulse_data_list
         return
 
     print(f"hdulist #{file_counter}: {len(pulse_data_list)} pulse(s) detected -> writing outputs.")
 
-    # ③ Save raw + corrected PSRFITS
     src = source_name_for_file if source_name_for_file is not None else source_name
     tel = telescope_for_file if telescope_for_file is not None else telescope
     version = version_for_file
@@ -778,12 +898,51 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                            f"PSR_{src}_{tel}_{file_counter:06d}_v{version}.fits")
     corr_out = os.path.join(output_corrected_psrfits_dir,
                             f"PSR_{src}_{tel}_{file_counter:06d}_v{version}_dm.fits")
-    hdulist.writeto(raw_out, overwrite=True, checksum=True)
-    corrected_hdulist.writeto(corr_out, overwrite=True, checksum=True)
-    print(f"  -> raw PSRFITS: {raw_out}")
+
+    fits_basename = os.path.basename(raw_out)
+    for pd in pulse_data_list:
+        pd['Fits'] = fits_basename
+
+    # corrected hdulist is the in-place mutated one
+    hdulist.writeto(corr_out, overwrite=True, checksum=True)
     print(f"  -> corrected PSRFITS: {corr_out}")
 
-    # ④ Save corresponding VDIF / Mark5B frame-aligned segment in raw dir
+    # v3: rebuild raw hdulist from the still-available subint_data_list.
+    # This path is rare (only when pulses are detected) so the rebuild cost
+    # is acceptable; the steady-state non-detection path now never copies.
+    raw_cols, raw_nsamples, raw_nsubints, raw_nchans = create_table_columns(
+        subint_data_list, subint_offsets_list, tsamp, center_freq,
+        nchans, chan_bw, coord, file_counter, continuous_freqs, global_offset,
+    )
+    raw_primary = create_primary_header(
+        start_time, tsamp, raw_nsamples, raw_nsubints,
+        center_freq, chan_bw, raw_nchans, dm, source_name, telescope,
+        coord, file_counter, global_offset,
+    )
+    raw_table = fits.BinTableHDU.from_columns(raw_cols, name='SUBINT')
+    rth = raw_table.header
+    rth['INT_TYPE'] = 'TIME'
+    rth['INT_UNIT'] = 'SEC'
+    rth['SCALE'] = 'FluxDen'
+    rth['NPOL'] = 1
+    rth['POL_TYPE'] = 'AA+BB'
+    rth['TBIN'] = tsamp
+    rth['NBIN'] = 1
+    rth['NBIN_PRD'] = 0
+    rth['PHS_OFFS'] = 0.0
+    rth['NBITS'] = 8
+    rth['NSUBOFFS'] = file_counter * raw_nsubints
+    rth['NCHAN'] = raw_nchans
+    rth['CHAN_BW'] = chan_bw
+    rth['NCHNOFFS'] = 0
+    rth['NSBLK'] = raw_nsamples
+    rth['EXTVER'] = 1
+    rth['TDIM16'] = f'(1,{raw_nchans},1,{raw_nsamples})'
+    raw_hdulist = fits.HDUList([raw_primary, raw_table])
+    del raw_cols
+    raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
+    print(f"  -> raw PSRFITS: {raw_out}")
+
     if vdif_input_file is not None and hdulist_total_samples > 0:
         seg_out = os.path.join(
             output_raw_psrfits_dir,
@@ -804,9 +963,19 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
         except Exception as e:
             print(f"  WARNING: failed to save baseband segment: {e}")
 
-    # ⑤ Append pulse rows to the shared collector
     if pulse_collector is not None:
         pulse_collector.extend(pulse_data_list)
+
+    # v2 R2: close hdulists to drop astropy internal caches before del
+    try:
+        raw_hdulist.close()
+    except Exception:
+        pass
+    try:
+        hdulist.close()
+    except Exception:
+        pass
+    del hdulist, raw_hdulist, pulse_data_list
 
 
 # =========================================================================
@@ -859,7 +1028,8 @@ def calculate_start_sample(file_counter, start_file, max_subints_per_file,
 
 
 # =========================================================================
-# *** MODIFIED ***  main loop with chunk-start tracking + pulse collector
+# *** MODIFIED in v2 ***  main loop with chunk-level del + periodic
+# gc.collect + malloc_trim every N hdulists.
 # =========================================================================
 
 def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
@@ -872,13 +1042,15 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     flag_edge_channels=2, calibrate_flux=True,
                     calibrate_bandpass=True, bspline_degree=3, bspline_smooth=1.0,
                     data_format='vdif', ref_time_str='', nchan=1, start_file=0,
-                    # ------------- New params ----------------
+                    # ------------- v1 params ----------------
                     dm_value=None, dm_ref_freq=None,
                     detection_params=None,
                     csv_output_path=None,
                     output_raw_psrfits_dir=None,
-                    output_corrected_psrfits_dir=None):
-    """Integrated VDIF -> DM correction -> pulse detection -> CSV pipeline."""
+                    output_corrected_psrfits_dir=None,
+                    # ------------- v2 params ----------------
+                    cleanup_every_n_hdulists=50):
+    """Integrated VDIF -> DM correction -> pulse detection -> CSV pipeline (v2)."""
     pulsar_coords = {
         "B0531+21": SkyCoord('05h34m31.97s', '+22d00m52.1s', frame='icrs'),
         "J0332+5434": SkyCoord('03h32m59.37s', '+54d34m43.6s', frame='icrs'),
@@ -888,7 +1060,6 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
     mask_array = np.array(mask)
 
-    # Parse sample rate string
     try:
         if '*u.MHz' in sample_rate_str:
             sample_rate_value = float(sample_rate_str.split('*')[0].strip()) * 1e6
@@ -911,10 +1082,32 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
         print(f"Error opening data file: {vdif_file}")
         return
 
-    # Collector accumulated across all hdulists in this run
     pulse_collector = []
 
-    with data_reader as file_obj:
+    # v2 announce
+    if cleanup_every_n_hdulists > 0:
+        print(f"### [memory] cleanup_every_n_hdulists = {cleanup_every_n_hdulists}: "
+              f"baseband reader recycle will run after every {cleanup_every_n_hdulists} hdulists.")
+    else:
+        print("### [memory] cleanup_every_n_hdulists = 0: baseband reader recycle DISABLED.")
+    print("### [memory] gc.collect() + malloc_trim(0) now run after EVERY hdulist "
+          "(R3 stronger cleanup).")
+    if _HAS_PSUTIL:
+        print("### [memory] psutil available -> per-hdulist RSS will be logged.")
+    else:
+        print("### [memory] psutil NOT available -> RSS will not be logged.")
+    if _TRACEMALLOC_ENABLED and _tracemalloc is not None:
+        print("### [memory] tracemalloc ENABLED via env TRACEMALLOC_ENABLED=1 -> "
+              "per-hdulist top-10 allocation growth will be logged.")
+        try:
+            _tracemalloc.start(25)
+        except Exception as e:
+            print(f"### [memory] tracemalloc.start() failed: {e}")
+    _tm_prev_snapshot = None
+
+    file_obj = data_reader
+    data_reader = None  # avoid keeping a second ref to the original reader
+    try:
         actual_sample_rate = file_obj.sample_rate.value
         reduced_sample_rate = actual_sample_rate / reduction_factor
         tsamp = 1.0 / reduced_sample_rate
@@ -935,17 +1128,22 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
         total_samples = file_obj.shape[0] - start_sample
         current_subint = 0
 
+        # v2 R2: progress tracking based on chunks read out of the file
+        total_chunks_planned = max(1, int(math.ceil(total_samples / chunk_size)))
+        chunks_processed = 0
+        print(f"### [progress] total chunks planned: {total_chunks_planned} "
+              f"(total samples to read: {total_samples})")
+        _log_rss(tag='startup')
+
         subint_data_list = []
         subint_times_list = []
         subint_offsets_list = []
-        subint_chunk_ranges = []  # NEW: list of (chunk_start, samples_to_read) per subint
+        subint_chunk_ranges = []
 
         for chunk_start in range(start_sample, start_sample + total_samples, chunk_size):
             end_sample = min(chunk_start + chunk_size, start_sample + total_samples)
             samples_to_read = end_sample - chunk_start
-            print(f"\n{'#' * 30}")
-            print(f"Processing chunk {current_subint}: samples "
-                  f"[{chunk_start}, {end_sample}) ({samples_to_read} samples)")
+            chunks_processed += 1
 
             try:
                 file_obj.seek(chunk_start)
@@ -953,6 +1151,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                 chunk_data = flag_xband_data(raw_data, mask=mask_array)
                 if chunk_data.size == 0:
                     print(f"Empty chunk at {chunk_start}, skipping")
+                    del raw_data, chunk_data
                     break
 
                 processed_data = Process_vdif_data_multiband(
@@ -964,32 +1163,32 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                 )
                 if processed_data.size == 0:
                     print(f"No data after processing chunk {current_subint}, skipping")
+                    del raw_data, chunk_data, processed_data
                     continue
 
                 file_obj.seek(chunk_start)
-                start_time = file_obj.tell(unit='time')
+                start_time_chunk = file_obj.tell(unit='time')
                 subint_offset = current_subint * tsamp * processed_data.shape[1]
 
                 subint_data_list.append(processed_data)
-                subint_times_list.append(start_time)
+                subint_times_list.append(start_time_chunk)
                 subint_offsets_list.append(subint_offset)
                 subint_chunk_ranges.append((chunk_start, samples_to_read))
+
+                # v2 L1: release transient per-chunk buffers (list still holds
+                # processed_data; this only drops the local name binding).
+                del raw_data, chunk_data, processed_data
 
                 current_subint += 1
 
                 if (current_subint % max_subints_per_file == 0
                         or chunk_start + chunk_size >= start_sample + total_samples):
                     if subint_data_list:
-                        # Compute VDIF sample range for the upcoming hdulist
                         hdulist_first_sample = subint_chunk_ranges[0][0]
                         last_start, last_count = subint_chunk_ranges[-1]
                         hdulist_total_samples = (last_start + last_count
                                                  - hdulist_first_sample)
 
-                        # NOTE: output_file argument is kept for signature
-                        # compatibility but is unused by the modified writer
-                        # (writes happen only when pulses are detected, and
-                        # paths come from the dedicated dirs).
                         write_psrfits_file_multiple_subints(
                             subint_data_list, subint_times_list, subint_offsets_list,
                             tsamp, center_freq, nband, chan_bw, nchans * nband, dm,
@@ -1014,11 +1213,67 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                             version_for_file=version,
                         )
 
-                        file_counter += 1
+                        # v2 L2: del the big lists, then re-create empty ones
+                        del subint_data_list, subint_times_list
+                        del subint_offsets_list, subint_chunk_ranges
                         subint_data_list = []
                         subint_times_list = []
                         subint_offsets_list = []
                         subint_chunk_ranges = []
+
+                        file_counter += 1
+
+                        # v2 R2: progress at hdulist boundary
+                        pct_h = 100.0 * chunks_processed / total_chunks_planned
+                        print(f"### [progress] hdulist #{file_counter - 1} done "
+                              f"[chunk {chunks_processed}/{total_chunks_planned}, "
+                              f"{pct_h:.2f}% of VDIF data]")
+
+                        # v2 R3: STRONGER cleanup -- run gc + malloc_trim + RSS log
+                        # after EVERY hdulist (not every N) so any per-hdulist
+                        # accumulation shows up immediately as a sawtooth.
+                        collected = gc.collect()
+                        trimmed = _trim_malloc()
+                        print(f"### [memory] gc.collect={collected} objects, "
+                              f"malloc_trim={'ok' if trimmed else 'skip'} "
+                              f"after hdulist #{file_counter - 1}")
+                        _log_rss(tag=f'after-hdulist-{file_counter - 1}')
+                        _tm_prev_snapshot = _tracemalloc_diff(
+                            _tm_prev_snapshot,
+                            tag=f'after-hdulist-{file_counter - 1}')
+
+                        # v2 L3 + R2: every cleanup_every_n_hdulists, also recycle
+                        # the baseband reader -- this drops baseband's internal
+                        # frame index / header cache (suspected leak source).
+                        if cleanup_every_n_hdulists > 0:
+                            written_count = file_counter - start_file
+                            if written_count > 0 and written_count % cleanup_every_n_hdulists == 0:
+                                _log_rss(tag=f'before-reader-recycle-hdulist-{file_counter - 1}')
+
+                                try:
+                                    file_obj.close()
+                                except Exception:
+                                    pass
+
+                                # Reopen a fresh reader; the next iteration will
+                                # seek() to the right sample so position is preserved.
+                                file_obj = open_data_file(
+                                    vdif_file, data_format, withsubband, subset,
+                                    sample_rate_value, ref_time_str, nchan)
+                                if file_obj is None:
+                                    print("### [memory] WARN: failed to reopen baseband "
+                                          "reader; aborting main loop.")
+                                    break
+                                try:
+                                    actual_sample_rate = file_obj.sample_rate.value
+                                except Exception:
+                                    pass
+                                # second gc/trim sweep right after the recycle
+                                gc.collect()
+                                _trim_malloc()
+                                print("### [memory] baseband reader recycled "
+                                      f"(after hdulist #{file_counter - 1}).")
+                                _log_rss(tag=f'after-reader-recycle-hdulist-{file_counter - 1}')
 
                 if file_counter >= max_files:
                     print(f"### Reached max_files limit of {max_files}")
@@ -1029,23 +1284,29 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                 import traceback
                 traceback.print_exc()
                 continue
+    finally:
+        try:
+            file_obj.close()
+        except Exception:
+            pass
 
-    # ---------- Final CSV emission ----------
     if pulse_collector:
         _save_pulse_collector_csv(pulse_collector, csv_output_path)
     else:
         print("\nNo pulses detected across the entire run. CSV not generated.")
 
+    # final cleanup
+    gc.collect()
+    _trim_malloc()
+
 
 def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
-    """Save the accumulated pulse rows to a timestamped CSV (no FITS_File col)."""
     if not pulse_data_list:
         return None
     df = pd.DataFrame(pulse_data_list)
 
     column_order = [
-        'Coarse_Index',
-        'Coarse_Rel_Time_ms', 'Coarse_Abs_MJD', 'Coarse_UTC_Time',
+        'Coarse_Index', 'Fits',
         'Precise_Rel_Time_ms', 'Precise_Abs_MJD', 'Precise_UTC_Time',
         'Precise_Time_Err_ms',
         'Precise_Center_Index', 'Center_Err',
@@ -1053,7 +1314,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
         'Background_Level', 'Background_Fit', 'Noise_Sigma',
         'SNR_Amplitude_Fit', 'SNR_Amplitude_Detection',
         'Flux_From_Fit', 'Flux_Err', 'SNR_Flux_From_Fit',
-        'Fit_Success', 'Detection_Method',
+        'Fit_Success',
     ]
 
     if 'Precise_JD1' in df.columns and 'Precise_JD2' in df.columns:
@@ -1106,14 +1367,8 @@ if __name__ == "__main__":
 
     print("Configuration loaded:")
     for key, value in params.items():
-        if key in ('detection_freq_mask_ranges',):
-            print(f"  {key}: {value}")
-        elif isinstance(value, (list, tuple)):
-            print(f"  {key}: {value}")
-        else:
-            print(f"  {key}: {value}")
+        print(f"  {key}: {value}")
 
-    # Build detection params dict expected by detect_pulses_in_hdulist
     detection_params = {
         'amp_snr_threshold': params['amp_snr_threshold'],
         'flux_snr_threshold': params['flux_snr_threshold'],
@@ -1123,7 +1378,6 @@ if __name__ == "__main__":
         'manual_mask_freq_ranges': params['detection_freq_mask_ranges'],
     }
 
-    # Resolve DM reference frequency
     dm_ref_freq = params['dm_ref_freq']
     if dm_ref_freq is None:
         dm_ref_freq = params['center_freq']
@@ -1134,7 +1388,7 @@ if __name__ == "__main__":
         print("Parameter inconsistency detected! Check chunk_size / reduction_factor / nchans.")
         sys.exit(1)
 
-    print("Parameters consistent, starting integrated pipeline...")
+    print("Parameters consistent, starting integrated pipeline v2...")
 
     vdif_to_psrfits(
         vdif_file=params['vdif_file'],
@@ -1167,13 +1421,13 @@ if __name__ == "__main__":
         ref_time_str=params.get('ref_time', ''),
         nchan=params.get('nchan', 1),
         start_file=params['start_file'],
-        # New
         dm_value=params['dm_source'],
         dm_ref_freq=dm_ref_freq,
         detection_params=detection_params,
         csv_output_path=params['csv_output_path'],
         output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
         output_corrected_psrfits_dir=params['output_corrected_psrfits_dir'],
+        cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
     )
 
     t1 = time.time()

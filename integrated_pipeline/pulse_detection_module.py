@@ -1,17 +1,17 @@
 """
-Pulse detection module that operates on an in-memory astropy.io.fits HDUList.
+Pulse detection module (v2) — operates on an in-memory astropy.io.fits HDUList.
 
-Adapted from former_script/Pulse_detection_v4.1_ur.py:
-- Detection algorithm (RFI removal -> light curve -> sigma clipping -> peak
-  detection -> Gaussian fitting -> v4.0 TOA) is copied verbatim.
-- The only file IO functions (read_psrfits_data, get_observation_start_info)
-  are replaced with hdulist-aware versions.
-- extract_pulse_data_for_csv loses the FITS_File column.
+v2 change vs v1: detect_pulses_in_hdulist drops each large intermediate
+array (data_2d, data_freq_cleaned, data_tf_cleaned, fit_results) as soon
+as the next stage no longer needs it, so peak resident memory during
+detection is one full-size array instead of three. Algorithm and float64
+precision are unchanged.
+
+Adapted from former_script/Pulse_detection_v4.1_ur.py.
 """
 
 import math
 import numpy as np
-from astropy.io import fits
 from astropy.time import Time
 import astropy.units as u
 from scipy.signal import find_peaks
@@ -313,6 +313,7 @@ def calculate_pulse_widths(lightcurve, times, peaks_index, threshold,
         else:
             raise ValueError("Method must be 'fwhm' or 'base'")
         pulse_widths.append(pulse_width)
+        del local_lightcurve, smoothed_lc  # release per-pulse working buffers
 
     pulse_widths = np.array(pulse_widths)
     pulse_widths_ms = pulse_widths * 1000
@@ -429,7 +430,7 @@ def get_coarse_time_precision(time_resolution):
 
 
 # ---------------------------------------------------------------------------
-# Precise pulse timing with Gaussian fitting (verbatim, plus minor cleanups)
+# Precise pulse timing with Gaussian fitting (verbatim)
 # ---------------------------------------------------------------------------
 
 def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_info,
@@ -535,7 +536,6 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         )
         flux_snr_pass = flux_snr_from_fit >= n_sigma_flux
 
-        # ▶ V4.0 TIME CALCULATION
         absolute_time_obj = None
         jd1 = jd2 = None
         precise_mjd_str = None
@@ -586,7 +586,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
 
 
 # ---------------------------------------------------------------------------
-# HDUList adapters (replace file-IO versions from the original script)
+# HDUList adapters
 # ---------------------------------------------------------------------------
 
 def _read_psrfits_data_from_hdulist(hdulist, subint_range=None, channel_range=None,
@@ -667,6 +667,8 @@ def _read_psrfits_data_from_hdulist(hdulist, subint_range=None, channel_range=No
         start_time = offs_sub - tsubint / 2
         times[start_idx:end_idx] = start_time + np.arange(nsblk) * tbin
 
+        del subint_raw, subint_reshaped, subint_2d  # release per-subint temporaries
+
     header_info = {
         'src_name': primary_hdr.get('SRC_NAME', 'Unknown'),
         'freq_center': primary_hdr.get('OBSFREQ', 0),
@@ -681,7 +683,6 @@ def _read_psrfits_data_from_hdulist(hdulist, subint_range=None, channel_range=No
 
 
 def _get_observation_start_info_from_hdulist(hdulist):
-    """Pull DATE-OBS + TBIN from an in-memory hdulist."""
     primary_hdr = hdulist[0].header
     subint_hdr = hdulist['SUBINT'].header
     date_obs_iso = primary_hdr.get('DATE-OBS')
@@ -745,9 +746,6 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
 
         pulse_data = {
             'Coarse_Index': int(peak_idx),
-            'Coarse_Rel_Time_ms': float(rel_time_ms_txt),
-            'Coarse_Abs_MJD': float(abs_mjd_txt),
-            'Coarse_UTC_Time': utc_time_txt,
             'Precise_Rel_Time_ms': float(precise_rel_time_ms),
             'Precise_Abs_MJD': float(precise_abs_mjd) if precise_abs_mjd is not None else np.nan,
             'Precise_UTC_Time': precise_utc,
@@ -797,7 +795,6 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             'Flux_Err': float(flux_err_val) if flux_err_val is not None else np.nan,
             'SNR_Flux_From_Fit': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
             'Fit_Success': True,
-            'Detection_Method': 'v4.0: DATE-OBS(T0) + mu_fit(samples) * TBIN(sec/sample)',
         })
         pulse_data_list.append(pulse_data)
 
@@ -812,27 +809,14 @@ def detect_pulses_in_hdulist(hdulist, params):
     """
     Run the full v4.1 pulse detection pipeline on an in-memory PSRFITS HDUList.
 
-    Parameters
-    ----------
-    hdulist : astropy.io.fits.HDUList
-        A (DM-corrected) PSRFITS HDUList.
-    params : dict
-        Detection parameters:
-        - amp_snr_threshold (float): amplitude SNR threshold
-        - flux_snr_threshold (float): post-fit flux SNR threshold
-        - peak_distance (int|None): min sample distance between peaks
-        - sigma_remove_rfi_frequency (float)
-        - sigma_remove_rfi_time_frequency (float)
-        - manual_mask_freq_ranges (list[(float, float)]): MHz ranges to mask
-        - min_prominence_sigma_factor (float, optional, default 0.3)
-        - rfi_time_freq_window (int, optional, default 200)
+    v2: explicit `del` of each huge intermediate array between detection
+    stages so that, at any moment, only one full-size data buffer is
+    resident instead of (data_2d + data_freq_cleaned + data_tf_cleaned).
 
     Returns
     -------
     list[dict]
-        Pulse data dicts (one per accepted pulse) suitable for direct
-        accumulation into a pandas DataFrame. Empty list if no pulses pass
-        both amplitude and flux SNR thresholds.
+        Pulse rows (no FITS_File column). Empty if nothing passes both SNRs.
     """
     n_sigma_amplitude = params['amp_snr_threshold']
     n_sigma_flux = params['flux_snr_threshold']
@@ -843,30 +827,36 @@ def detect_pulses_in_hdulist(hdulist, params):
     min_prom_factor = params.get('min_prominence_sigma_factor', 0.3)
     tf_window = params.get('rfi_time_freq_window', 200)
 
+    print("=" * 60)
+    print("Pulse detection (in-memory, v2)")
+    print("=" * 60)
+
     # ----- Step 1: Read data from hdulist -----
-    print("=" * 60)
-    print("Pulse detection (in-memory)")
-    print("=" * 60)
     data_2d, freqs, times, header_info = _read_psrfits_data_from_hdulist(
         hdulist, normalize=True, pol_index=0
     )
 
-    # ----- Step 2: Frequency-domain RFI removal (with manual mask) -----
+    # ----- Step 2: Frequency-domain RFI removal -----
     manual_mask = ({'freq_ranges': list(manual_mask_ranges)}
                    if manual_mask_ranges else None)
     data_freq_cleaned, _ = remove_rfi_frequency_domain(
         data_2d, freqs=freqs, method='sigma_clip',
         sigma=sigma_rfi_freq, percentile=80, manual_mask=manual_mask
     )
+    # data_2d is no longer needed; freq_cleaned has its own buffer
+    del data_2d
 
-    # ----- Step 3: Time-frequency-domain RFI removal -----
+    # ----- Step 3: Time-frequency RFI removal -----
     data_tf_cleaned, _ = remove_rfi_time_frequency(
         data_freq_cleaned, window_size=tf_window, sigma=sigma_rfi_tf
     )
+    del data_freq_cleaned
 
-    # ----- Step 4: Light curve + background estimation -----
+    # ----- Step 4: Light curve + background -----
     lightcurve = create_lightcurve(data_tf_cleaned)
+    del data_tf_cleaned  # the small lightcurve replaces the big 2D buffer
     final_times = times
+
     M_final, sigma_final, _ = iterative_sigma_clipping(
         lightcurve, initial_K=3, final_K=5, max_iterations=50
     )
@@ -876,7 +866,7 @@ def detect_pulses_in_hdulist(hdulist, params):
         print("Invalid background/noise estimate; skipping.")
         return []
 
-    # ----- Step 5: Peak detection (amplitude SNR only) -----
+    # ----- Step 5: Peak detection -----
     peaks_detected, _, amplitude_snrs_detected = detect_pulses_v3(
         lightcurve=lightcurve, times=final_times,
         background_level=M_final, noise_sigma=sigma_final,
@@ -895,10 +885,10 @@ def detect_pulses_in_hdulist(hdulist, params):
         M_final + n_sigma_amplitude * sigma_final, method='base'
     )
 
-    # ----- Step 7: Get DATE-OBS + TBIN from hdulist for v4.0 TOA -----
+    # ----- Step 7: DATE-OBS + TBIN -----
     date_obs_iso, obs_info = _get_observation_start_info_from_hdulist(hdulist)
 
-    # ----- Step 8: Precise pulse timing with Gaussian fit + flux SNR cut -----
+    # ----- Step 8: Precise pulse timing -----
     time_resolution = (final_times[1] - final_times[0]
                        if len(final_times) > 1 else header_info.get('tbin', 1e-6))
     _precise_peaks, _precise_times, fit_results = precise_pulse_timing(
@@ -912,9 +902,10 @@ def detect_pulses_in_hdulist(hdulist, params):
     )
     if len(fit_results) == 0:
         print("No pulses passed the flux SNR threshold after Gaussian fitting.")
+        del lightcurve, final_times, times, freqs, _precise_peaks, _precise_times
         return []
 
-    # ----- Step 9: Compute coarse-time arrays (mirrors save_pulse_results_to_file) -----
+    # ----- Step 9: Coarse-time arrays -----
     coarse_relative_times = final_times[peaks_detected]
     coarse_relative_times_rounded = np.round(coarse_relative_times, 6)
     coarse_relative_times_ms = coarse_relative_times_rounded * 1000
@@ -926,7 +917,7 @@ def detect_pulses_in_hdulist(hdulist, params):
     coarse_utc_times = mjd_to_utc_string(coarse_absolute_mjd,
                                          subsecond_digits=coarse_utc_digits)
 
-    # ----- Step 10: Build CSV rows (no FITS_File column) -----
+    # ----- Step 10: CSV rows -----
     pulse_data_list = _extract_pulse_data_for_csv(
         peaks_detected, final_times, date_obs_iso, fit_results,
         M_final, sigma_final,
@@ -934,4 +925,8 @@ def detect_pulses_in_hdulist(hdulist, params):
         n_sigma_amplitude=n_sigma_amplitude, n_sigma_flux=n_sigma_flux,
     )
     print(f"Detected {len(pulse_data_list)} pulses passing both SNR thresholds.")
+
+    # Drop heavy intermediates before returning (param_covariance arrays inside
+    # fit_results were the largest accumulation per call)
+    del fit_results, lightcurve, final_times, times, freqs
     return pulse_data_list
