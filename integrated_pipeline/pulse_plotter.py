@@ -72,6 +72,92 @@ def _read_psrfits_data(fits_file, pol_index=0):
         return data_2d, header_info
 
 
+def _read_psrfits_data_from_hdulist(hdulist, pol_index=0):
+    """Read PSRFITS data from an in-memory HDUList.
+
+    Returns (data_2d, header_info) matching _read_psrfits_data format,
+    with 'freqs' and 'times' inside header_info.
+
+    Parameters
+    ----------
+    hdulist : astropy.io.fits.HDUList
+        In-memory PSRFITS HDUList (must have 'SUBINT' extension).
+    pol_index : int
+        Polarization index to extract (default 0).
+
+    Returns
+    -------
+    data_2d : np.ndarray, shape (total_samples, nchan), dtype float64
+    header_info : dict
+        Keys: tbin, nchan, nsblk, nsubint_total, freqs, times
+    """
+    subint_hdu = hdulist['SUBINT']
+    subint_hdr = subint_hdu.header
+    subint_data = subint_hdu.data
+
+    nsubint_total = subint_hdr['NAXIS2']
+    nchan = subint_hdr['NCHAN']
+    npol = subint_hdr['NPOL']
+    nsblk = subint_hdr['NSBLK']
+    tbin = subint_hdr['TBIN']
+
+    # Flexible TDIM lookup (handles TDIM16/17/18)
+    tdim_str = (subint_hdr.get('TDIM17') or subint_hdr.get('TDIM16')
+                or subint_hdr.get('TDIM18'))
+    if tdim_str is None:
+        for key in subint_hdr.keys():
+            if key.startswith('TDIM'):
+                tdim_str = subint_hdr[key]
+                break
+    tdim = tdim_str.strip('()')
+    dims = [int(x) for x in tdim.split(',')]
+
+    data_2d = np.zeros((nsubint_total * nsblk, nchan), dtype=np.float64)
+
+    for i in range(nsubint_total):
+        subint_raw = subint_data['DATA'][i]
+        subint_reshaped = subint_raw.reshape(dims)
+
+        if len(dims) == 4 and dims[0] == 1:
+            subint_pol = subint_reshaped[0, :, pol_index, :]
+            subint_2d = subint_pol.T
+        else:
+            nsblk_idx = np.argwhere(np.array(dims) == nsblk)[0][0]
+            nchan_idx = np.argwhere(np.array(dims) == nchan)[0][0]
+            npol_idx = np.argwhere(np.array(dims) == npol)[0][0]
+            perm = [nsblk_idx, nchan_idx, npol_idx]
+            subint_reordered = subint_reshaped.transpose(perm)
+            subint_2d = subint_reordered[:, :, pol_index]
+
+        subint_2d = subint_2d.astype(np.float64, copy=False)
+
+        dat_scl = subint_data['DAT_SCL'][i]
+        dat_offs = subint_data['DAT_OFFS'][i]
+        dat_scl_resh = dat_scl.reshape(nchan, npol)[:, pol_index]
+        dat_offs_resh = dat_offs.reshape(nchan, npol)[:, pol_index]
+        for chan in range(nchan):
+            subint_2d[:, chan] = (subint_2d[:, chan] * dat_scl_resh[chan]
+                                  + dat_offs_resh[chan])
+
+        start_idx = i * nsblk
+        end_idx = (i + 1) * nsblk
+        data_2d[start_idx:end_idx, :] = subint_2d
+
+    freqs = subint_data['DAT_FREQ'][0]  # MHz
+    n_total_samples = nsubint_total * nsblk
+    times = np.arange(n_total_samples) * tbin  # seconds
+
+    header_info = {
+        'tbin': tbin,
+        'nchan': nchan,
+        'nsblk': nsblk,
+        'nsubint_total': nsubint_total,
+        'freqs': freqs,
+        'times': times,
+    }
+    return data_2d, header_info
+
+
 def _safe_slice(data, center_idx, half_width, num_widths=5):
     """Slice data around center_idx with padding for boundary cases."""
     data_height, data_width = data.shape
@@ -267,15 +353,16 @@ def _plot_single_pulse(original_data, corrected_data, center_idx, half_width,
 
 def plot_pulses_for_hdulist(raw_fits_path, corrected_fits_path,
                             pulse_data_list, output_dir,
-                            src, tel, file_counter, version):
+                            src, tel, file_counter, version,
+                            raw_hdulist=None, corrected_hdulist=None):
     """Plot waterfall images for all pulses detected in one hdulist.
 
     Parameters
     ----------
     raw_fits_path : str
-        Path to the raw (un-corrected) PSRFITS file.
-    corrected_fits_path : str
-        Path to the DM-corrected PSRFITS file.
+        Path to the raw (un-corrected) PSRFITS file (disk).
+    corrected_fits_path : str or None
+        Path to the DM-corrected PSRFITS file (disk); None if not saved.
     pulse_data_list : list[dict]
         List of pulse detection result dicts (from detect_pulses_in_hdulist).
     output_dir : str
@@ -286,24 +373,38 @@ def plot_pulses_for_hdulist(raw_fits_path, corrected_fits_path,
         FITS file counter, embedded in the image filename.
     version : int
         Version number for the filename.
+    raw_hdulist : astropy.io.fits.HDUList, optional
+        In-memory raw (un-corrected) HDUList. Takes priority over raw_fits_path.
+    corrected_hdulist : astropy.io.fits.HDUList, optional
+        In-memory DM-corrected HDUList. Takes priority over corrected_fits_path.
     """
     if not pulse_data_list:
         return
 
     os.makedirs(output_dir, exist_ok=True)
 
-    raw_fits_name = os.path.basename(raw_fits_path)
-    corrected_fits_name = os.path.basename(corrected_fits_path)
+    raw_fits_name = os.path.basename(raw_fits_path) if raw_fits_path else "raw (in-memory)"
+    if corrected_fits_path:
+        corrected_fits_name = os.path.basename(corrected_fits_path)
+    else:
+        corrected_fits_name = (f"PSR_{src}_{tel}_{file_counter:06d}"
+                               f"_v{version}_dmcorr.fits")
 
     try:
-        original_data, orig_header = _read_psrfits_data(raw_fits_path)
+        if raw_hdulist is not None:
+            original_data, orig_header = _read_psrfits_data_from_hdulist(raw_hdulist)
+        else:
+            original_data, orig_header = _read_psrfits_data(raw_fits_path)
     except Exception as e:
-        print(f"  WARNING: failed to read raw FITS {raw_fits_path}: {e}")
+        print(f"  WARNING: failed to read raw data: {e}")
         return
     try:
-        corrected_data, corr_header = _read_psrfits_data(corrected_fits_path)
+        if corrected_hdulist is not None:
+            corrected_data, corr_header = _read_psrfits_data_from_hdulist(corrected_hdulist)
+        else:
+            corrected_data, corr_header = _read_psrfits_data(corrected_fits_path)
     except Exception as e:
-        print(f"  WARNING: failed to read corrected FITS {corrected_fits_path}: {e}")
+        print(f"  WARNING: failed to read corrected data: {e}")
         return
 
     tbin_us = corr_header.get('tbin', orig_header['tbin']) * 1e6
