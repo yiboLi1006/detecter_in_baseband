@@ -1,12 +1,15 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v5.1).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v5b.1).
+
+v5b.1 change vs v5.1: output only raw PSRFITS files; DM-corrected PSRFITS removed
+to avoid NaN/0-value ambiguity in the corrected output.
 
 v5.1 change vs v5:  uint8 PSRFITS output (PRESTO / DSPSR compatibility).
 All v5 time-system and TOA fixes are unchanged.
 
 v5.1 uint8 output:
-  - Raw and DM-corrected PSRFITS DATA columns are written as uint8
+  - Raw PSRFITS DATA columns are written as uint8
     (format='B', NBITS=8) instead of float32.  Quantisation (float32→uint8,
     clip to [0,255]) happens ONLY at the final writeto step, AFTER
     DM correction and pulse detection have completed in float32/float64.
@@ -869,7 +872,6 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         dm_value=None, dm_ref_freq=None,
                                         detection_params=None,
                                         output_raw_psrfits_dir=None,
-                                        output_corrected_psrfits_dir=None,
                                         pulse_collector=None,
                                         vdif_input_file=None,
                                         data_format='vdif',
@@ -951,33 +953,15 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     version = version_for_file
 
     os.makedirs(output_raw_psrfits_dir, exist_ok=True)
-    os.makedirs(output_corrected_psrfits_dir, exist_ok=True)
 
     raw_out = os.path.join(output_raw_psrfits_dir,
                            f"PSR_{src}_{tel}_{file_counter:06d}_v{version}.fits")
-    corr_out = os.path.join(output_corrected_psrfits_dir,
-                            f"PSR_{src}_{tel}_{file_counter:06d}_v{version}_dm.fits")
 
     fits_basename = os.path.basename(raw_out)
     for pd in pulse_data_list:
         pd['Fits'] = fits_basename
 
-    # Convert corrected hdulist DATA from float32 to uint8 for PRESTO/DSPSR compat
-    subint_hdu = hdulist['SUBINT']
-    subint_rec = subint_hdu.data
-    for i in range(len(subint_rec)):
-        data_f32 = subint_rec['DATA'][i]
-        subint_rec['DATA'][i] = np.clip(
-            np.round(np.nan_to_num(data_f32, nan=0.0)), 0, 255
-        ).astype(np.uint8)
-    # Fix column format: TFORM17 (DATA) from 'E' (float32) to 'B' (uint8)
-    for col in subint_hdu.columns:
-        if col.name == 'DATA':
-            col.format = col.format.replace('E', 'B')
-            break
-    subint_hdu.header['NBITS'] = 8
-    hdulist.writeto(corr_out, overwrite=True, checksum=True)
-
+    # v5b.1: only raw PSRFITS output; DM-corrected FITS removed (NaN/0 ambiguity)
     # v5.1: rebuild raw hdulist from the still-available subint_data_list,
     # converting to uint8 for PRESTO/DSPSR compatibility.
     # This path is rare (only when pulses are detected) so the rebuild cost
@@ -1135,7 +1119,6 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     detection_params=None,
                     csv_output_path=None,
                     output_raw_psrfits_dir=None,
-                    output_corrected_psrfits_dir=None,
                     plot_output_dir=None,
                     # ------------- v2 params ----------------
                     cleanup_every_n_hdulists=50):
@@ -1274,7 +1257,6 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                             dm_value=dm_value, dm_ref_freq=dm_ref_freq,
                             detection_params=detection_params,
                             output_raw_psrfits_dir=output_raw_psrfits_dir,
-                            output_corrected_psrfits_dir=output_corrected_psrfits_dir,
                             pulse_collector=pulse_collector,
                             vdif_input_file=vdif_file,
                             data_format=data_format,
@@ -1454,7 +1436,7 @@ if __name__ == "__main__":
                             params['nchans']):
         sys.exit(1)
 
-    print("Starting integrated pipeline v5...")
+    print("Starting integrated pipeline v5b.1...")
 
     vdif_to_psrfits(
         vdif_file=params['vdif_file'],
@@ -1492,7 +1474,6 @@ if __name__ == "__main__":
         detection_params=detection_params,
         csv_output_path=params['csv_output_path'],
         output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
-        output_corrected_psrfits_dir=params['output_corrected_psrfits_dir'],
         plot_output_dir=params.get('plot_output_dir') or None,
         cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
     )
