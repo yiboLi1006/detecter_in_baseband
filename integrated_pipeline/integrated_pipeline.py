@@ -1001,8 +1001,9 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
         try:
             from pulse_plotter import plot_pulses_for_hdulist
             plot_pulses_for_hdulist(
-                raw_out, corr_out, pulse_data_list, plot_output_dir,
+                raw_out, None, pulse_data_list, plot_output_dir,
                 src, tel, file_counter, version,
+                raw_hdulist=raw_hdulist, corrected_hdulist=hdulist,
             )
         except Exception as e:
             print(f"  WARNING: failed to plot pulse waterfalls: {e}")
