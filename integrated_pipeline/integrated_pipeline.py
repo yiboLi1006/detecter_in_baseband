@@ -944,9 +944,9 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
         except Exception:
             pass
         del hdulist, pulse_data_list
-        return
+        return 0
 
-    print(f"\nhdulist #{file_counter}: {len(pulse_data_list)} pulse(s) detected")
+    n_pulses = len(pulse_data_list)
 
     src = source_name_for_file if source_name_for_file is not None else source_name
     tel = telescope_for_file if telescope_for_file is not None else telescope
@@ -1049,6 +1049,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     except Exception:
         pass
     del hdulist, raw_hdulist, pulse_data_list
+    return n_pulses
 
 
 # =========================================================================
@@ -1248,7 +1249,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                         hdulist_total_samples = (last_start + last_count
                                                  - hdulist_first_sample)
 
-                        write_psrfits_file_multiple_subints(
+                        n_pulses = write_psrfits_file_multiple_subints(
                             subint_data_list, subint_times_list, subint_offsets_list,
                             tsamp, center_freq, nband, chan_bw, nchans * nband, dm,
                             source_name, telescope, coord,
@@ -1293,7 +1294,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                         print(f"\r### progress: {pct_h:.1f}%  "
                               f"hdulist #{file_counter - 1}  "
                               f"chunk {chunks_processed}/{total_chunks_planned}"
-                              f"{rss_str}  ", end='', flush=True)
+                              f"  pulses: {n_pulses}{rss_str}  ",
+                              end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
                         gc.collect()
@@ -1397,7 +1399,9 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 # =========================================================================
 
 if __name__ == "__main__":
-    print("#" * 60)
+    print("=" * 50)
+    print("  detecter_in_baseband  v5b.1")
+    print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
 
@@ -1436,8 +1440,6 @@ if __name__ == "__main__":
     if not check_parameters(params['chunk_size'], params['reduction_factor'],
                             params['nchans']):
         sys.exit(1)
-
-    print("Starting integrated pipeline v5b.1...")
 
     vdif_to_psrfits(
         vdif_file=params['vdif_file'],
