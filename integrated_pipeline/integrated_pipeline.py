@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v5).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v5a.1).
+
+v5a.1 change vs v5: output only raw PSRFITS files; DM-corrected PSRFITS removed
+to avoid NaN/0-value ambiguity in the corrected output.
 
 v5 change vs v3:  PSRFITS time-system reconstruction.
 Memory cleanup layers inherited from v2/v3 are unchanged.
@@ -848,7 +851,6 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         dm_value=None, dm_ref_freq=None,
                                         detection_params=None,
                                         output_raw_psrfits_dir=None,
-                                        output_corrected_psrfits_dir=None,
                                         pulse_collector=None,
                                         vdif_input_file=None,
                                         data_format='vdif',
@@ -929,20 +931,15 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     version = version_for_file
 
     os.makedirs(output_raw_psrfits_dir, exist_ok=True)
-    os.makedirs(output_corrected_psrfits_dir, exist_ok=True)
 
     raw_out = os.path.join(output_raw_psrfits_dir,
                            f"PSR_{src}_{tel}_{file_counter:06d}_v{version}.fits")
-    corr_out = os.path.join(output_corrected_psrfits_dir,
-                            f"PSR_{src}_{tel}_{file_counter:06d}_v{version}_dm.fits")
 
     fits_basename = os.path.basename(raw_out)
     for pd in pulse_data_list:
         pd['Fits'] = fits_basename
 
-    # corrected hdulist is the in-place mutated one
-    hdulist.writeto(corr_out, overwrite=True, checksum=True)
-
+    # v5a.1: only raw PSRFITS output; DM-corrected FITS removed (NaN/0 ambiguity)
     # v5: rebuild raw hdulist from the still-available subint_data_list.
     # This path is rare (only when pulses are detected) so the rebuild cost
     # is acceptable; the steady-state non-detection path now never copies.
@@ -1094,7 +1091,6 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     detection_params=None,
                     csv_output_path=None,
                     output_raw_psrfits_dir=None,
-                    output_corrected_psrfits_dir=None,
                     plot_output_dir=None,
                     # ------------- v2 params ----------------
                     cleanup_every_n_hdulists=50):
@@ -1233,7 +1229,6 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                             dm_value=dm_value, dm_ref_freq=dm_ref_freq,
                             detection_params=detection_params,
                             output_raw_psrfits_dir=output_raw_psrfits_dir,
-                            output_corrected_psrfits_dir=output_corrected_psrfits_dir,
                             pulse_collector=pulse_collector,
                             vdif_input_file=vdif_file,
                             data_format=data_format,
@@ -1413,7 +1408,7 @@ if __name__ == "__main__":
                             params['nchans']):
         sys.exit(1)
 
-    print("Starting integrated pipeline v5...")
+    print("Starting integrated pipeline v5a.1...")
 
     vdif_to_psrfits(
         vdif_file=params['vdif_file'],
@@ -1451,7 +1446,6 @@ if __name__ == "__main__":
         detection_params=detection_params,
         csv_output_path=params['csv_output_path'],
         output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
-        output_corrected_psrfits_dir=params['output_corrected_psrfits_dir'],
         plot_output_dir=params.get('plot_output_dir') or None,
         cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
     )
