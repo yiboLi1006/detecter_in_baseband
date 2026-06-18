@@ -891,7 +891,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th['NBIN'] = 1
     th['NBIN_PRD'] = 0
     th['PHS_OFFS'] = 0.0
-    th['NBITS'] = 8
+    th['NBITS'] = -32  # negative = IEEE float32 (DATA column format 'E')
     th['NSUBOFFS'] = file_counter * n_subints
     th['NCHAN'] = actual_nchans
     th['CHAN_BW'] = chan_bw
@@ -966,7 +966,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['NBIN'] = 1
     rth['NBIN_PRD'] = 0
     rth['PHS_OFFS'] = 0.0
-    rth['NBITS'] = 8
+    rth['NBITS'] = -32  # negative = IEEE float32 (DATA column format 'E')
     rth['NSUBOFFS'] = file_counter * raw_nsubints
     rth['NCHAN'] = raw_nchans
     rth['CHAN_BW'] = chan_bw
