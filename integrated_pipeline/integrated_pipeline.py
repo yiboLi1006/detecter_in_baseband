@@ -7,11 +7,10 @@ All v5 time-system and TOA fixes are unchanged.
 
 v5.1 uint8 output:
   - Raw and DM-corrected PSRFITS DATA columns are written as uint8
-    (format='B', NBITS=8) instead of float32.  Values are clipped to
-    [0, 255] and rounded.
-  - The DM correction and pulse detection algorithms still operate in
-    float64 internally -- the quantisation happens only at the final
-    FITS column build stage, so detection results are unaffected.
+    (format='B', NBITS=8) instead of float32.  Quantisation (float32→uint8,
+    clip to [0,255]) happens ONLY at the final writeto step, AFTER
+    DM correction and pulse detection have completed in float32/float64.
+    Detection results are therefore identical to v5.
   - This makes the output files directly readable by PRESTO prepsubband,
     DSPSR, and other C-based pulsar toolchains that expect integer data.
 
@@ -890,11 +889,11 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
 
     start_time = subint_times_list[0]
 
-    # v5.1: uint8 DATA column for PRESTO/DSPSR compatibility
+    # Build with float32 for DM correction + pulse detection accuracy;
+    # uint8 conversion deferred to final writeto below (PRESTO/DSPSR compat).
     cols, nsamples_per_subint, n_subints, actual_nchans = create_table_columns(
         subint_data_list, subint_offsets_list, tsamp, center_freq,
         nchans, chan_bw, coord, file_counter, continuous_freqs,
-        data_format='B',
     )
 
     primary_hdu = create_primary_header(
@@ -914,7 +913,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th['NBIN'] = 1
     th['NBIN_PRD'] = 0
     th['PHS_OFFS'] = 0.0
-    th['NBITS'] = 8
+    th['NBITS'] = -32  # float32 during processing; updated to 8 at writeto
     th['NSUBOFFS'] = file_counter * n_subints
     th['NCHAN'] = actual_nchans
     th['CHAN_BW'] = chan_bw
@@ -963,7 +962,20 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     for pd in pulse_data_list:
         pd['Fits'] = fits_basename
 
-    # corrected hdulist is the in-place mutated one
+    # Convert corrected hdulist DATA from float32 to uint8 for PRESTO/DSPSR compat
+    subint_hdu = hdulist['SUBINT']
+    subint_rec = subint_hdu.data
+    for i in range(len(subint_rec)):
+        data_f32 = subint_rec['DATA'][i]
+        subint_rec['DATA'][i] = np.clip(
+            np.round(np.nan_to_num(data_f32, nan=0.0)), 0, 255
+        ).astype(np.uint8)
+    # Fix column format: TFORM17 (DATA) from 'E' (float32) to 'B' (uint8)
+    for col in subint_hdu.columns:
+        if col.name == 'DATA':
+            col.format = col.format.replace('E', 'B')
+            break
+    subint_hdu.header['NBITS'] = 8
     hdulist.writeto(corr_out, overwrite=True, checksum=True)
 
     # v5.1: rebuild raw hdulist from the still-available subint_data_list,
