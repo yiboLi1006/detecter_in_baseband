@@ -89,7 +89,6 @@ def remove_rfi_frequency_domain(data_2d, freqs=None, method='sigma_clip',
     if method == 'percentile':
         _ = np.percentile(data_2d, percentile)
     with np.errstate(invalid='ignore'):
-        with np.errstate(invalid='ignore'):
         mean_spectrum = np.nanmean(data_2d, axis=0)
     freq_mask = np.ones(mean_spectrum.shape, dtype=bool)
 
