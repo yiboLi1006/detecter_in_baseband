@@ -961,19 +961,11 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     for pd in pulse_data_list:
         pd['Fits'] = fits_basename
 
-    # v5b.1: only raw PSRFITS output; DM-corrected FITS removed (NaN/0 ambiguity)
-    # v5.1: rebuild raw hdulist from the still-available subint_data_list,
-    # converting to uint8 for PRESTO/DSPSR compatibility.
-    # This path is rare (only when pulses are detected) so the rebuild cost
-    # is acceptable; the steady-state non-detection path now never copies.
-    raw_subint_data_list = [
-        np.clip(np.round(np.nan_to_num(sd, nan=0.0)), 0, 255).astype(np.uint8)
-        for sd in subint_data_list
-    ]
+    # v5b.1: build raw hdulist in float32 first -- preserves NaN for plotting;
+    # uint8 conversion happens after plotting, just before writeto.
     raw_cols, raw_nsamples, raw_nsubints, raw_nchans = create_table_columns(
-        raw_subint_data_list, subint_offsets_list, tsamp, center_freq,
+        subint_data_list, subint_offsets_list, tsamp, center_freq,
         nchans, chan_bw, coord, file_counter, continuous_freqs,
-        data_format='B',
     )
     raw_primary = create_primary_header(
         obs_start_time, tsamp, raw_nsamples, raw_nsubints,
@@ -991,7 +983,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['NBIN'] = 1
     rth['NBIN_PRD'] = 0
     rth['PHS_OFFS'] = 0.0
-    rth['NBITS'] = 8
+    rth['NBITS'] = -32  # float32 during plotting; updated to 8 at writeto
     rth['NSUBOFFS'] = file_counter * raw_nsubints
     rth['NCHAN'] = raw_nchans
     rth['CHAN_BW'] = chan_bw
@@ -1002,8 +994,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['DM'] = dm_value if dm_value is not None else dm
     rth['REFFREQ'] = dm_ref_freq if dm_ref_freq is not None else center_freq
     raw_hdulist = fits.HDUList([raw_primary, raw_table])
-    del raw_cols, raw_subint_data_list
-    raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
+    del raw_cols
 
     if vdif_input_file is not None and hdulist_total_samples > 0:
         seg_out = os.path.join(
@@ -1035,6 +1026,21 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
             )
         except Exception as e:
             print(f"  WARNING: failed to plot pulse waterfalls: {e}")
+
+    # Convert raw hdulist from float32 to uint8 for PRESTO/DSPSR compat
+    raw_subint_hdu = raw_hdulist['SUBINT']
+    raw_subint_rec = raw_subint_hdu.data
+    for i in range(len(raw_subint_rec)):
+        data_f32 = raw_subint_rec['DATA'][i]
+        raw_subint_rec['DATA'][i] = np.clip(
+            np.round(np.nan_to_num(data_f32, nan=0.0)), 0, 255
+        ).astype(np.uint8)
+    for col in raw_subint_hdu.columns:
+        if col.name == 'DATA':
+            col.format = col.format.replace('E', 'B')
+            break
+    raw_subint_hdu.header['NBITS'] = 8
+    raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
 
     if pulse_collector is not None:
         pulse_collector.extend(pulse_data_list)
