@@ -949,7 +949,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     )
     raw_primary = create_primary_header(
         obs_start_time, tsamp, raw_nsamples, raw_nsubints,
-        center_freq, chan_bw, raw_nchans, dm, source_name, telescope,
+        center_freq, chan_bw, raw_nchans, 0, source_name, telescope,
         coord, file_counter,
     )
     raw_table = fits.BinTableHDU.from_columns(raw_cols, name='SUBINT')
@@ -971,8 +971,8 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['NSBLK'] = raw_nsamples
     rth['EXTVER'] = 1
     rth['TDIM16'] = f'(1,{raw_nchans},1,{raw_nsamples})'
-    rth['DM'] = dm_value if dm_value is not None else dm
-    rth['REFFREQ'] = dm_ref_freq if dm_ref_freq is not None else center_freq
+    rth['DM'] = 0
+    rth['REFFREQ'] = 0
     raw_hdulist = fits.HDUList([raw_primary, raw_table])
     del raw_cols
     raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
