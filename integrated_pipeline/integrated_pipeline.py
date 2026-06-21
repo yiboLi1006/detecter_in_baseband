@@ -1038,19 +1038,52 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
         except Exception as e:
             print(f"  WARNING: failed to plot pulse waterfalls: {e}")
 
-    # Convert raw hdulist from float32 to uint8 for PRESTO/DSPSR compat
-    raw_subint_hdu = raw_hdulist['SUBINT']
-    raw_subint_rec = raw_subint_hdu.data
-    for i in range(len(raw_subint_rec)):
-        data_f32 = raw_subint_rec['DATA'][i]
-        raw_subint_rec['DATA'][i] = np.clip(
-            np.round(np.nan_to_num(data_f32, nan=0.0)), 0, 255
-        ).astype(np.uint8)
-    for col in raw_subint_hdu.columns:
-        if col.name == 'DATA':
-            col.format = col.format.replace('E', 'B')
-            break
-    raw_subint_hdu.header['NBITS'] = 8
+    # Write raw output as uint8 for PRESTO/DSPSR compat. The float32
+    # raw_hdulist above served only plotting (NaN preserved); for writing we
+    # rebuild a uint8 SUBINT table from the source subint_data_list.
+    #
+    # The previous in-place approach was broken (v6 regression vs v5a.1, which
+    # wrote float32 directly): `col.format = col.format.replace('E','B')`
+    # yields a bare str -- astropy's _ColumnFormat (str subclass carrying
+    # .recformat) is lost, so writeto's _scale_back aborts with
+    # "'str' object has no attribute 'recformat'". Assigning uint8 into a
+    # float32 record column also silently casts back to float32. Rebuilding
+    # with data_format='B' (as create_table_columns already supports) avoids
+    # both pitfalls.
+    try:
+        raw_hdulist.close()
+    except Exception:
+        pass
+    del raw_hdulist
+
+    u_cols, u_nsamples, u_nsubints, u_nchans = create_table_columns(
+        subint_data_list, subint_offsets_list, tsamp, center_freq,
+        nchans, chan_bw, coord, file_counter, continuous_freqs,
+        data_format='B',
+    )
+    u_table = fits.BinTableHDU.from_columns(u_cols, name='SUBINT')
+    uth = u_table.header
+    uth['INT_TYPE'] = 'TIME'
+    uth['INT_UNIT'] = 'SEC'
+    uth['SCALE'] = 'Uncorr'
+    uth['NPOL'] = 1
+    uth['POL_TYPE'] = 'AA+BB'
+    uth['TBIN'] = tsamp
+    uth['NBIN'] = 1
+    uth['NBIN_PRD'] = 0
+    uth['PHS_OFFS'] = 0.0
+    uth['NBITS'] = 8
+    uth['NSUBOFFS'] = file_counter * u_nsubints
+    uth['NCHAN'] = u_nchans
+    uth['CHAN_BW'] = chan_bw
+    uth['NCHNOFFS'] = 0
+    uth['NSBLK'] = u_nsamples
+    uth['EXTVER'] = 1
+    uth['TDIM16'] = f'(1,{u_nchans},1,{u_nsamples})'
+    uth['DM'] = 0
+    # REFFREQ intentionally omitted: this raw file is NOT DM-corrected.
+    raw_hdulist = fits.HDUList([raw_primary, u_table])
+    del u_cols
     raw_hdulist.writeto(raw_out, overwrite=True, checksum=True)
 
     if pulse_collector is not None:
