@@ -992,7 +992,9 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth['EXTVER'] = 1
     rth['TDIM16'] = f'(1,{raw_nchans},1,{raw_nsamples})'
     rth['DM'] = 0
-    rth['REFFREQ'] = 0
+    # REFFREQ intentionally omitted: this raw file is NOT DM-corrected.
+    # Leaving REFFREQ unset (instead of 0) avoids an ambiguous 0 MHz
+    # reference frequency that could confuse PRESTO/PSRCHIVE readers.
     raw_hdulist = fits.HDUList([raw_primary, raw_table])
     del raw_cols
 
