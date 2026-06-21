@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v5b.1).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v6.0).
+
+v6.0: merged v5a + v5b. Raw PSRFITS output as uint8 (PRESTO/DSPSR compat);
+DM-corrected FITS removed; raw headers DM=0/CHAN_DM=0 (REFFREQ omitted).
 
 v5b.1 change vs v5.1: output only raw PSRFITS files; DM-corrected PSRFITS removed
 to avoid NaN/0-value ambiguity in the corrected output.
@@ -1408,7 +1411,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v5b.1")
+    print("  detecter_in_baseband  v6.0")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
