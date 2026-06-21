@@ -3,7 +3,7 @@
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v6.0).
 
 v6.0: merged v5a + v5b. Raw PSRFITS output as uint8 (PRESTO/DSPSR compat);
-DM-corrected FITS removed; raw headers DM=0/CHAN_DM=0 (REFFREQ omitted).
+DM-corrected FITS removed; raw headers DM=0 (REFFREQ/CHAN_DM omitted).
 
 v5b.1 change vs v5.1: output only raw PSRFITS files; DM-corrected PSRFITS removed
 to avoid NaN/0-value ambiguity in the corrected output.
@@ -749,7 +749,6 @@ def create_primary_header(obs_start_time, tsamp, nsamples_per_subint, n_subints,
     header['OBSFREQ'] = center_freq
     header['OBSBW'] = chan_bw * nchans
     header['OBSNCHAN'] = nchans
-    header['CHAN_DM'] = dm
     header['SRC_NAME'] = source_name
     header['COORD_MD'] = 'J2000'
     header['EQUINOX'] = 2000.0
@@ -911,7 +910,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     th = table_hdu.header
     th['INT_TYPE'] = 'TIME'
     th['INT_UNIT'] = 'SEC'
-    th['SCALE'] = 'FluxDen'
+    th['SCALE'] = 'Uncorr'
     th['NPOL'] = 1
     th['POL_TYPE'] = 'AA+BB'
     th['TBIN'] = tsamp
@@ -979,7 +978,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     rth = raw_table.header
     rth['INT_TYPE'] = 'TIME'
     rth['INT_UNIT'] = 'SEC'
-    rth['SCALE'] = 'FluxDen'
+    rth['SCALE'] = 'Uncorr'
     rth['NPOL'] = 1
     rth['POL_TYPE'] = 'AA+BB'
     rth['TBIN'] = tsamp
