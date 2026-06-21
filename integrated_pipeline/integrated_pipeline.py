@@ -810,6 +810,13 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
             np.arange(actual_nchans) - actual_nchans / 2 + 0.5)
 
     dat_wts = np.ones(actual_nchans, dtype=np.float32)
+    # Mark bad channels (all-NaN frequency channels) with DAT_WTS=0 so that
+    # PRESTO/PSRCHIVE ignore them after uint8 quantisation turns NaN -> 0 in
+    # the DATA column. Bad channels are a frequency-axis property, so the
+    # mask derived from the first subint applies to all subints.
+    if first_subint_data.size > 0:
+        bad_chan_mask = np.all(np.isnan(first_subint_data), axis=1)
+        dat_wts[bad_chan_mask] = 0.0
     dat_offs = np.zeros(actual_nchans, dtype=np.float32)
     dat_scl = np.ones(actual_nchans, dtype=np.float32)
 
