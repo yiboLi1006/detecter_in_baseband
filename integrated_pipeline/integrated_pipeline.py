@@ -175,10 +175,10 @@ def _log_rss(tag=''):
         pass
 
 
-def _log_total_rss_percent():
-    """v7: 打印主进程+所有子进程的总 RSS 及占系统内存百分比（psutil 不可用则静默）。"""
+def _get_total_rss_percent():
+    """v7: 返回 (total_rss_gib, sys_total_gib, pct)；psutil 不可用返回 None。"""
     if not _HAS_PSUTIL:
-        return
+        return None
     try:
         proc = _psutil.Process()
         total_rss = proc.memory_info().rss
@@ -188,11 +188,18 @@ def _log_total_rss_percent():
             except Exception:
                 pass
         sys_total = _psutil.virtual_memory().total
-        print(f"### [memory] total RSS = {total_rss / (1 << 30):.2f} GiB / "
-              f"{sys_total / (1 << 30):.1f} GiB "
-              f"({total_rss / sys_total * 100:.1f}%)")
+        return total_rss / (1 << 30), sys_total / (1 << 30), total_rss / sys_total * 100
     except Exception:
-        pass
+        return None
+
+
+def _log_total_rss_percent():
+    """v7: 打印主进程+所有子进程的总 RSS 及占系统内存百分比（psutil 不可用则静默）。"""
+    info = _get_total_rss_percent()
+    if info:
+        rss_gib, sys_gib, pct = info
+        print(f"### [memory] total RSS = {rss_gib:.2f} GiB / "
+              f"{sys_gib:.1f} GiB ({pct:.1f}%)")
 
 
 def _parse_sample_rate(sample_rate_str):
@@ -1224,10 +1231,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
     sample_rate_value = _parse_sample_rate(sample_rate_str)
 
-    # v7: worker 日志前缀 + 进度行控制（多进程换行避免 \r 互相覆盖）
+    # v7: worker 日志前缀（多进程事件日志用；逐 hdulist 进度仅单进程原地刷新）
     prefix = f"{worker_label} " if worker_label else ""
-    _progress_nl = '\r' if not worker_label else ''
-    _progress_end = '' if not worker_label else '\n'
     # v7: 全局 hdulist 上限；end_file=None 时退回 max_files（单进程兼容）
     hdulist_hard_limit = max_files if end_file is None else min(max_files, end_file)
 
@@ -1371,19 +1376,20 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
                         file_counter += 1
 
-                        # progress at hdulist boundary (inline refresh)
-                        pct_h = 100.0 * chunks_processed / total_chunks_planned
-                        rss_str = ''
-                        if _HAS_PSUTIL:
-                            try:
-                                rss_str = f'  RSS={_psutil.Process().memory_info().rss / (1 << 30):.2f}GiB'
-                            except Exception:
-                                pass
-                        print(f"{_progress_nl}{prefix}### progress: {pct_h:.1f}%  "
-                              f"hdulist #{file_counter - 1}  "
-                              f"chunk {chunks_processed}/{total_chunks_planned}"
-                              f"  pulses: {n_pulses}{rss_str}  ",
-                              end=_progress_end, flush=True)
+                        # progress at hdulist boundary (单进程原地刷新；多进程由主进程汇总行刷新)
+                        if not worker_label:
+                            pct_h = 100.0 * chunks_processed / total_chunks_planned
+                            rss_str = ''
+                            if _HAS_PSUTIL:
+                                try:
+                                    rss_str = f'  RSS={_psutil.Process().memory_info().rss / (1 << 30):.2f}GiB'
+                                except Exception:
+                                    pass
+                            print(f"\r### progress: {pct_h:.1f}%  "
+                                  f"hdulist #{file_counter - 1}  "
+                                  f"chunk {chunks_processed}/{total_chunks_planned}"
+                                  f"  pulses: {n_pulses}{rss_str}  ",
+                                  end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
                         gc.collect()
@@ -1414,7 +1420,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                                     pass
                                 gc.collect()
                                 _trim_malloc()
-                                print(f"\n{prefix}### baseband reader recycled (after hdulist #{file_counter - 1})")
+                                if not worker_label:
+                                    print(f"\n### baseband reader recycled (after hdulist #{file_counter - 1})")
 
                 if file_counter >= hdulist_hard_limit:
                     print(f"\n{prefix}### Reached hdulist limit ({hdulist_hard_limit})")
@@ -1498,7 +1505,6 @@ def _worker_process_range(worker_args):
             return_pulses=True,                     # v7: 返回 pulse_list
             worker_label=worker_label,              # v7: 日志前缀
         ) or []
-        print(f"{worker_label} done: {len(pulse_list)} pulses")
         return (worker_idx, pulse_list)
     except Exception as e:
         import traceback
@@ -1534,13 +1540,21 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
                     'params': params, 'detection_params': detection_params,
                     'dm_ref_freq': dm_ref_freq} for i, (hs, he) in enumerate(bounds)]
 
-    # v7: daemon 内存监控线程，每 5 秒打印总 RSS + 占系统百分比
+    # v7: daemon 进度/内存监控线程，原地刷新一行总进度（避免多 worker 刷屏）
     import threading
     stop_mon = threading.Event()
+    state = {'done': 0, 'pulses': 0}   # 主进程内线程共享（GIL 保证原子）
 
     def _monitor():
         while not stop_mon.wait(5.0):
-            _log_total_rss_percent()
+            info = _get_total_rss_percent()
+            mem_str = ''
+            if info:
+                rss_gib, sys_gib, pct = info
+                mem_str = f" | total RSS: {rss_gib:.2f}/{sys_gib:.1f} GiB ({pct:.1f}%)"
+            print(f"\r### progress: workers {state['done']}/{n_workers} done | "
+                  f"pulses: {state['pulses']}{mem_str}   ",
+                  end='', flush=True)
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
     mon_t.start()
@@ -1556,12 +1570,16 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
                 wid = futures[fut]
                 try:
                     _idx, plist = fut.result()
+                    state['done'] += 1
                     if plist:
+                        state['pulses'] += len(plist)
                         global_pulses.extend(plist)
                 except Exception as e:
-                    print(f"### v7 worker {wid} crashed: {e}")
+                    state['done'] += 1
+                    print(f"\n### v7 worker {wid} crashed: {e}")
     finally:
-        stop_mon.set()   # 停止内存监控
+        stop_mon.set()   # 停止监控
+    print()  # 结束原地刷新行
 
     # v7: 合并后按 Precise_Abs_MJD_Str 排序（全局时间序）
     if global_pulses:
