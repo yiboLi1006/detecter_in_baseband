@@ -175,6 +175,37 @@ def _log_rss(tag=''):
         pass
 
 
+def _log_total_rss_percent():
+    """v7: 打印主进程+所有子进程的总 RSS 及占系统内存百分比（psutil 不可用则静默）。"""
+    if not _HAS_PSUTIL:
+        return
+    try:
+        proc = _psutil.Process()
+        total_rss = proc.memory_info().rss
+        for child in proc.children(recursive=True):
+            try:
+                total_rss += child.memory_info().rss
+            except Exception:
+                pass
+        sys_total = _psutil.virtual_memory().total
+        print(f"### [memory] total RSS = {total_rss / (1 << 30):.2f} GiB / "
+              f"{sys_total / (1 << 30):.1f} GiB "
+              f"({total_rss / sys_total * 100:.1f}%)")
+    except Exception:
+        pass
+
+
+def _parse_sample_rate(sample_rate_str):
+    """v7: 解析 ini 的 sample_rate 字符串（如 '32*u.MHz'）为 Hz 浮点数，失败回退 32e6。"""
+    try:
+        if '*u.MHz' in sample_rate_str:
+            return float(sample_rate_str.split('*')[0].strip()) * 1e6
+        expr = sample_rate_str.replace('u.', '')
+        return float(expr.split('*')[0].strip()) * 1e6
+    except Exception:
+        return 32e6
+
+
 def _dump_tracemalloc_top(cur_snap, ref_snap, top_n, tag, label):
     """Print top-N (file:lineno) blocks by size_diff vs ref_snap."""
     if cur_snap is None or ref_snap is None:
@@ -388,8 +419,11 @@ def read_config(config_file):
     if config.has_section('performance'):
         params['cleanup_every_n_hdulists'] = config.getint(
             'performance', 'cleanup_every_n_hdulists', fallback=50)
+        params['n_processes'] = config.getint(
+            'performance', 'n_processes', fallback=1)   # v7: 1=单进程兼容
     else:
         params['cleanup_every_n_hdulists'] = 50
+        params['n_processes'] = 1
 
     return params
 
@@ -1173,7 +1207,11 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     output_raw_psrfits_dir=None,
                     plot_output_dir=None,
                     # ------------- v2 params ----------------
-                    cleanup_every_n_hdulists=50):
+                    cleanup_every_n_hdulists=50,
+                    # ------------- v7 params ----------------
+                    end_file=None,          # 全局 hdulist 上限（不含）；None 退回 max_files
+                    return_pulses=False,    # True: 不内部写 csv，返回 pulse_list
+                    worker_label=None):     # 日志前缀 "[worker i]"；None 无前缀
     """Integrated VDIF -> DM correction -> pulse detection -> CSV pipeline (v2)."""
     pulsar_coords = {
         "B0531+21": SkyCoord('05h34m31.97s', '+22d00m52.1s', frame='icrs'),
@@ -1184,14 +1222,14 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
     mask_array = np.array(mask)
 
-    try:
-        if '*u.MHz' in sample_rate_str:
-            sample_rate_value = float(sample_rate_str.split('*')[0].strip()) * 1e6
-        else:
-            expr = sample_rate_str.replace('u.', '')
-            sample_rate_value = float(expr.split('*')[0].strip()) * 1e6
-    except Exception:
-        sample_rate_value = 32e6
+    sample_rate_value = _parse_sample_rate(sample_rate_str)
+
+    # v7: worker 日志前缀 + 进度行控制（多进程换行避免 \r 互相覆盖）
+    prefix = f"{worker_label} " if worker_label else ""
+    _progress_nl = '\r' if not worker_label else ''
+    _progress_end = '' if not worker_label else '\n'
+    # v7: 全局 hdulist 上限；end_file=None 时退回 max_files（单进程兼容）
+    hdulist_hard_limit = max_files if end_file is None else min(max_files, end_file)
 
     continuous_freqs = None
     if subband_centers is not None and len(subband_centers) == len(subset):
@@ -1341,11 +1379,11 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                                 rss_str = f'  RSS={_psutil.Process().memory_info().rss / (1 << 30):.2f}GiB'
                             except Exception:
                                 pass
-                        print(f"\r### progress: {pct_h:.1f}%  "
+                        print(f"{_progress_nl}{prefix}### progress: {pct_h:.1f}%  "
                               f"hdulist #{file_counter - 1}  "
                               f"chunk {chunks_processed}/{total_chunks_planned}"
                               f"  pulses: {n_pulses}{rss_str}  ",
-                              end='', flush=True)
+                              end=_progress_end, flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
                         gc.collect()
@@ -1376,14 +1414,14 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                                     pass
                                 gc.collect()
                                 _trim_malloc()
-                                print(f"\n### baseband reader recycled (after hdulist #{file_counter - 1})")
+                                print(f"\n{prefix}### baseband reader recycled (after hdulist #{file_counter - 1})")
 
-                if file_counter >= max_files:
-                    print(f"\n### Reached max_files limit of {max_files}")
+                if file_counter >= hdulist_hard_limit:
+                    print(f"\n{prefix}### Reached hdulist limit ({hdulist_hard_limit})")
                     break
 
             except Exception as e:
-                print(f"\nError processing chunk {current_subint}: {e}")
+                print(f"\n{prefix}Error processing chunk {current_subint}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -1394,8 +1432,150 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
             pass
 
     print()  # finalise inline progress line
+    if return_pulses:
+        # v7: 多进程模式，返回脉冲列表给主进程统一合并排序
+        return pulse_collector
     if pulse_collector:
         _save_pulse_collector_csv(pulse_collector, csv_output_path)
+    else:
+        print("\nNo pulses detected. CSV not generated.")
+    return None
+
+
+def _worker_process_range(worker_args):
+    """v7 顶层 worker 函数（Windows spawn 兼容，可 pickle）。
+    处理全局 hdulist 区间 [h_start, h_end)，返回 (worker_idx, pulse_list)。"""
+    worker_idx = worker_args['worker_idx']
+    h_start = worker_args['h_start']
+    h_end = worker_args['h_end']
+    params = worker_args['params']
+    detection_params = worker_args['detection_params']
+    dm_ref_freq = worker_args['dm_ref_freq']
+
+    worker_label = f"[worker {worker_idx}]"
+    print(f"{worker_label} start: hdulist [{h_start}, {h_end})")
+
+    try:
+        pulse_list = vdif_to_psrfits(
+            vdif_file=params['vdif_file'],
+            output_dir=params['output_dir'],
+            reduction_factor=params['reduction_factor'],
+            subset=params['subbands'],
+            nchans=params['nchans'],
+            dm=params['dm_source'],
+            source_name=params['source_name'],
+            telescope=params['telescope'],
+            chunk_size=params['chunk_size'],
+            center_freq=params['center_freq'],
+            nband=len(params['subbands']),
+            bandwidth=params['subband_width'],
+            max_subints_per_file=params['max_subints_per_file'],
+            max_files=params['max_files'],          # 保留 ini 原值；实际由 end_file 截断
+            mask=params['mask_sband'],
+            version=params['version'],
+            withsubband=params['withsubband'],
+            subband_centers=params.get('subband_centers'),
+            t_start=params['t_start'],
+            sample_rate_str=params.get('sample_rate', '32*u.MHz'),
+            usb=params.get('usb', 'U'),
+            usb_list=params.get('usb_list'),
+            flag_edge_channels=params['flag_band_edge'],
+            calibrate_flux=True,
+            calibrate_bandpass=params['calib_bandpass'],
+            bspline_degree=3, bspline_smooth=1.0,
+            data_format=params['data_format'],
+            ref_time_str=params.get('ref_time', ''),
+            nchan=params.get('nchan', 1),
+            start_file=h_start,                     # v7: 全局 hdulist 起始
+            dm_value=params['dm_source'],
+            dm_ref_freq=dm_ref_freq,
+            detection_params=detection_params,
+            csv_output_path=None,                   # v7: 多进程不内部写 csv
+            output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
+            plot_output_dir=params.get('plot_output_dir') or None,
+            cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
+            end_file=h_end,                         # v7: 全局 hdulist 上限（不含）
+            return_pulses=True,                     # v7: 返回 pulse_list
+            worker_label=worker_label,              # v7: 日志前缀
+        ) or []
+        print(f"{worker_label} done: {len(pulse_list)} pulses")
+        return (worker_idx, pulse_list)
+    except Exception as e:
+        import traceback
+        print(f"{worker_label} FATAL: {e}")
+        traceback.print_exc()
+        return (worker_idx, [])
+
+
+def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
+    """v7: 多进程调度。把全局 hdulist 区间 [0, m) 分成 n 段并行处理，
+    合并所有 worker 的 pulse_list 后按 Precise_Abs_MJD_Str 排序，写一个全局 csv。"""
+    sample_rate_value = _parse_sample_rate(params.get('sample_rate', '32*u.MHz'))
+    reader = open_data_file(
+        params['vdif_file'], params['data_format'], params['withsubband'],
+        params['subbands'], sample_rate_value,
+        params.get('ref_time', ''), params.get('nchan', 1))
+    if reader is None:
+        print(f"Error opening data file: {params['vdif_file']}")
+        return
+    L = reader.shape[0]
+    reader.close()
+
+    chunk_size = params['chunk_size']
+    max_subints = params['max_subints_per_file']
+    total_chunks = max(1, math.ceil(L / chunk_size))
+    m = max(1, math.ceil(total_chunks / max_subints))           # 全局 hdulist 数
+    n_workers = min(n_processes, m)                             # n>m 时多余不启动
+    bounds = [(i * m // n_workers, (i + 1) * m // n_workers) for i in range(n_workers)]
+    print(f"### v7 multiprocess: m={m} hdulists, n_processes={n_processes}, "
+          f"n_workers={n_workers}, ranges={bounds}")
+
+    worker_args = [{'worker_idx': i, 'h_start': hs, 'h_end': he,
+                    'params': params, 'detection_params': detection_params,
+                    'dm_ref_freq': dm_ref_freq} for i, (hs, he) in enumerate(bounds)]
+
+    # v7: daemon 内存监控线程，每 5 秒打印总 RSS + 占系统百分比
+    import threading
+    stop_mon = threading.Event()
+
+    def _monitor():
+        while not stop_mon.wait(5.0):
+            _log_total_rss_percent()
+
+    mon_t = threading.Thread(target=_monitor, daemon=True)
+    mon_t.start()
+
+    # v7: 并行执行，as_completed 收集（顺序无关，最终按时间排序）
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    global_pulses = []
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = {ex.submit(_worker_process_range, a): a['worker_idx']
+                       for a in worker_args}
+            for fut in as_completed(futures):
+                wid = futures[fut]
+                try:
+                    _idx, plist = fut.result()
+                    if plist:
+                        global_pulses.extend(plist)
+                except Exception as e:
+                    print(f"### v7 worker {wid} crashed: {e}")
+    finally:
+        stop_mon.set()   # 停止内存监控
+
+    # v7: 合并后按 Precise_Abs_MJD_Str 排序（全局时间序）
+    if global_pulses:
+        if all('Precise_Abs_MJD_Str' in p and p['Precise_Abs_MJD_Str'] not in (None, '')
+               for p in global_pulses):
+            global_pulses.sort(key=lambda p: float(p['Precise_Abs_MJD_Str']))
+        else:
+            import re
+            def _fc(p):
+                mm = re.search(r'_(\d{6})_v', str(p.get('Fits', '')))
+                return (int(mm.group(1)) if mm else 0,
+                        float(p.get('Precise_Center_Index', 0)))
+            global_pulses.sort(key=_fc)
+        _save_pulse_collector_csv(global_pulses, params['csv_output_path'])
     else:
         print("\nNo pulses detected. CSV not generated.")
 
@@ -1450,7 +1630,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v6.0")
+    print("  detecter_in_baseband  v7.0")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
@@ -1472,6 +1652,7 @@ if __name__ == "__main__":
           f"nchans={params['nchans']}  reduction_factor={params['reduction_factor']}")
     print(f"Max files : {params['max_files']}  "
           f"subints_per_file={params['max_subints_per_file']}")
+    print(f"Processes : n_processes={params.get('n_processes', 1)}")
 
     detection_params = {
         'amp_snr_threshold': params['amp_snr_threshold'],
@@ -1491,45 +1672,53 @@ if __name__ == "__main__":
                             params['nchans']):
         sys.exit(1)
 
-    vdif_to_psrfits(
-        vdif_file=params['vdif_file'],
-        output_dir=params['output_dir'],
-        reduction_factor=params['reduction_factor'],
-        subset=params['subbands'],
-        nchans=params['nchans'],
-        dm=params['dm_source'],
-        source_name=params['source_name'],
-        telescope=params['telescope'],
-        chunk_size=params['chunk_size'],
-        center_freq=params['center_freq'],
-        nband=len(params['subbands']),
-        bandwidth=params['subband_width'],
-        max_subints_per_file=params['max_subints_per_file'],
-        max_files=params['max_files'],
-        mask=params['mask_sband'],
-        version=params['version'],
-        withsubband=params['withsubband'],
-        subband_centers=params.get('subband_centers'),
-        t_start=params['t_start'],
-        sample_rate_str=params.get('sample_rate', '32*u.MHz'),
-        usb=params.get('usb', 'U'),
-        usb_list=params.get('usb_list'),
-        flag_edge_channels=params['flag_band_edge'],
-        calibrate_flux=True,
-        calibrate_bandpass=params['calib_bandpass'],
-        bspline_degree=3, bspline_smooth=1.0,
-        data_format=params['data_format'],
-        ref_time_str=params.get('ref_time', ''),
-        nchan=params.get('nchan', 1),
-        start_file=params['start_file'],
-        dm_value=params['dm_source'],
-        dm_ref_freq=dm_ref_freq,
-        detection_params=detection_params,
-        csv_output_path=params['csv_output_path'],
-        output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
-        plot_output_dir=params.get('plot_output_dir') or None,
-        cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
-    )
+    n_processes = params.get('n_processes', 1)
+    if n_processes and n_processes > 1:
+        # ---------- v7 多进程路径 ----------
+        print(f"### v7 multiprocess mode: n_processes={n_processes}")
+        run_multiprocess(params, detection_params, dm_ref_freq, n_processes)
+    else:
+        # ---------- 单进程路径（v6.1 完全兼容）----------
+        vdif_to_psrfits(
+            vdif_file=params['vdif_file'],
+            output_dir=params['output_dir'],
+            reduction_factor=params['reduction_factor'],
+            subset=params['subbands'],
+            nchans=params['nchans'],
+            dm=params['dm_source'],
+            source_name=params['source_name'],
+            telescope=params['telescope'],
+            chunk_size=params['chunk_size'],
+            center_freq=params['center_freq'],
+            nband=len(params['subbands']),
+            bandwidth=params['subband_width'],
+            max_subints_per_file=params['max_subints_per_file'],
+            max_files=params['max_files'],
+            mask=params['mask_sband'],
+            version=params['version'],
+            withsubband=params['withsubband'],
+            subband_centers=params.get('subband_centers'),
+            t_start=params['t_start'],
+            sample_rate_str=params.get('sample_rate', '32*u.MHz'),
+            usb=params.get('usb', 'U'),
+            usb_list=params.get('usb_list'),
+            flag_edge_channels=params['flag_band_edge'],
+            calibrate_flux=True,
+            calibrate_bandpass=params['calib_bandpass'],
+            bspline_degree=3, bspline_smooth=1.0,
+            data_format=params['data_format'],
+            ref_time_str=params.get('ref_time', ''),
+            nchan=params.get('nchan', 1),
+            start_file=params['start_file'],
+            dm_value=params['dm_source'],
+            dm_ref_freq=dm_ref_freq,
+            detection_params=detection_params,
+            csv_output_path=params['csv_output_path'],
+            output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
+            plot_output_dir=params.get('plot_output_dir') or None,
+            cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
+            end_file=None, return_pulses=False, worker_label=None,
+        )
 
     t1 = time.time()
     print(f"### USED time: {t1 - t0:.3f} sec")
