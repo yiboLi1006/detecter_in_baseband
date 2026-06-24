@@ -858,18 +858,38 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
     if first_subint_data.size > 0:
         bad_chan_mask = np.all(np.isnan(first_subint_data), axis=1)
         dat_wts[bad_chan_mask] = 0.0
-    dat_offs = np.zeros(actual_nchans, dtype=np.float32)
-    dat_scl = np.ones(actual_nchans, dtype=np.float32)
-
     total_elements_per_subint = 1 * actual_nchans * 1 * nsamples_per_subint
     # v5.1: uint8 output for PRESTO compatibility
+    # v7.1: per-channel DAT_SCL/DAT_OFFS 把 float 数据映射到 [0,255], 充分
+    # 利用 8 bit 动态范围. 旧码硬编码 scl=1/offs=0 + clip(sd,0,255), 当 float
+    # 数据范围仅 ~0-11 时 uint8 只用底部 ~12 级, 精度严重丢失, PRESTO 无法
+    # 检测脉冲. PSRFITS 还原公式: data = uint8 * DAT_SCL + DAT_OFFS,
+    # 故量化: uint8 = clip(round((data - DAT_OFFS) / DAT_SCL), 0, 255).
     if data_format == 'B':
+        # 基于整个 hdulist 所有 subints 的 per-channel min/max 求 scale,
+        # 使每通道数据范围映射到 [0,255]; 常数/坏通道(range=0)退回 scl=1/offs=0
+        chan_min = np.full(actual_nchans, np.inf, dtype=np.float64)
+        chan_max = np.full(actual_nchans, -np.inf, dtype=np.float64)
+        for sd in subint_data_list:
+            s = np.nan_to_num(sd, nan=0.0)
+            chan_min = np.minimum(chan_min, s.min(axis=1))
+            chan_max = np.maximum(chan_max, s.max(axis=1))
+        chan_range = chan_max - chan_min
+        valid = chan_range > 0
+        dat_scl = np.where(valid, chan_range / 255.0, 1.0).astype(np.float32)
+        dat_offs = np.where(valid, chan_min.astype(np.float32),
+                            np.float32(0.0)).astype(np.float32)
+        offs_col = dat_offs.reshape(-1, 1)
+        scl_col = dat_scl.reshape(-1, 1)
         data_arrays = [
-            np.clip(np.round(np.nan_to_num(sd, nan=0.0)), 0, 255).astype(np.uint8)
+            np.clip(np.round((np.nan_to_num(sd, nan=0.0) - offs_col) / scl_col),
+                    0, 255).astype(np.uint8)
             .reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
             for sd in subint_data_list
         ]
     else:
+        dat_offs = np.zeros(actual_nchans, dtype=np.float32)
+        dat_scl = np.ones(actual_nchans, dtype=np.float32)
         data_arrays = [
             sd.reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
             for sd in subint_data_list
