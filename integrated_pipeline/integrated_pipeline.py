@@ -860,29 +860,31 @@ def create_table_columns(subint_data_list, subint_offsets_list, tsamp,
         dat_wts[bad_chan_mask] = 0.0
     total_elements_per_subint = 1 * actual_nchans * 1 * nsamples_per_subint
     # v5.1: uint8 output for PRESTO compatibility
-    # v7.1: per-channel DAT_SCL/DAT_OFFS 把 float 数据映射到 [0,255], 充分
-    # 利用 8 bit 动态范围. 旧码硬编码 scl=1/offs=0 + clip(sd,0,255), 当 float
-    # 数据范围仅 ~0-11 时 uint8 只用底部 ~12 级, 精度严重丢失, PRESTO 无法
-    # 检测脉冲. PSRFITS 还原公式: data = uint8 * DAT_SCL + DAT_OFFS,
-    # 故量化: uint8 = clip(round((data - DAT_OFFS) / DAT_SCL), 0, 255).
+    # v7.2: per-channel DAT_SCL/DAT_OFFS 把 float 数据逐通道映射到 [0,255]，
+    # 但通道间 DAT_SCL 差异导致 PRESTO 消色散求和时各通道权重不等，脉冲丢失。
+    # v7.3: float32 全局映射到 [0,255], DAT_SCL=1.0 / DAT_OFFS=0.0 固定不变，
+    # 所有通道等权，适配 PRESTO incoherent 消色散。
     if data_format == 'B':
-        # 基于整个 hdulist 所有 subints 的 per-channel min/max 求 scale,
-        # 使每通道数据范围映射到 [0,255]; 常数/坏通道(range=0)退回 scl=1/offs=0
-        chan_min = np.full(actual_nchans, np.inf, dtype=np.float64)
-        chan_max = np.full(actual_nchans, -np.inf, dtype=np.float64)
+        # 全局 min/max（仅统计非 NaN 的正常通道），所有通道共享同一映射
+        global_min = np.inf
+        global_max = -np.inf
         for sd in subint_data_list:
-            s = np.nan_to_num(sd, nan=0.0)
-            chan_min = np.minimum(chan_min, s.min(axis=1))
-            chan_max = np.maximum(chan_max, s.max(axis=1))
-        chan_range = chan_max - chan_min
-        valid = chan_range > 0
-        dat_scl = np.where(valid, chan_range / 255.0, 1.0).astype(np.float32)
-        dat_offs = np.where(valid, chan_min.astype(np.float32),
-                            np.float32(0.0)).astype(np.float32)
-        offs_col = dat_offs.reshape(-1, 1)
-        scl_col = dat_scl.reshape(-1, 1)
+            # 排除全 NaN 坏通道，其余 NaN 填 0 参与统计
+            s_filled = np.nan_to_num(sd, nan=0.0)
+            ch_valid = ~np.all(np.isnan(sd), axis=1) if np.any(np.isnan(sd)) else np.ones(sd.shape[0], dtype=bool)
+            if ch_valid.any():
+                global_min = min(global_min, s_filled[ch_valid].min())
+                global_max = max(global_max, s_filled[ch_valid].max())
+        global_range = global_max - global_min
+        if global_range <= 0:
+            global_range = 1.0
+
+        dat_scl = np.ones(actual_nchans, dtype=np.float32)
+        dat_offs = np.zeros(actual_nchans, dtype=np.float32)
+
         data_arrays = [
-            np.clip(np.round((np.nan_to_num(sd, nan=0.0) - offs_col) / scl_col),
+            np.clip(np.round((np.nan_to_num(sd, nan=global_min) - global_min)
+                             * 255.0 / global_range),
                     0, 255).astype(np.uint8)
             .reshape(1, actual_nchans, 1, nsamples_per_subint).flatten()
             for sd in subint_data_list
@@ -1668,7 +1670,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.1")
+    print("  detecter_in_baseband  v7.3")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
