@@ -364,6 +364,21 @@ def calculate_background_init(lightcurve, start_idx, end_idx, window_size_sample
 
 
 def calculate_flux_snr_from_fit(A_fit, A_err, sigma_fit, sigma_err, noise_sigma):
+    """Calculate flux SNR from Gaussian fit parameters.
+
+    Returns
+    -------
+    flux : float
+        Gaussian area  A * sigma * sqrt(2*pi).
+    flux_err : float
+        Propagated uncertainty from fit parameter errors.
+    flux_snr : float
+        Fit-quality SNR = flux / flux_err (how well the fit constrains flux).
+    flux_snr_conventional : float
+        Matched-filter fluence SNR = (A / sigma_n) * sqrt(sigma * sqrt(pi)).
+        This is the traditional radiometer-equation SNR: the integrated pulse
+        flux divided by the expected noise fluctuation over the pulse width.
+    """
     flux = A_fit * sigma_fit * np.sqrt(2 * np.pi)
     if A_fit > 0 and sigma_fit > 0 and A_err > 0 and sigma_err > 0:
         rel_A = A_err / A_fit
@@ -372,7 +387,19 @@ def calculate_flux_snr_from_fit(A_fit, A_err, sigma_fit, sigma_err, noise_sigma)
     else:
         flux_err = max(flux * 0.05, noise_sigma * sigma_fit * np.sqrt(2 * np.pi))
     flux_snr = flux / flux_err if flux_err > 0 else 0
-    return flux, flux_err, flux_snr
+
+    # Conventional matched-filter fluence SNR (radiometer equation).
+    # For a Gaussian pulse  A*exp(-t^2/(2*sigma^2))  in white noise:
+    #   (SNR_flu)^2 = (1/sigma_n^2) * integral(A^2 * exp(-t^2/sigma^2) dt)
+    #               = (A/sigma_n)^2 * sigma * sqrt(pi)
+    #   SNR_flu    = SNR_amp * sqrt(sigma * sqrt(pi))
+    if noise_sigma is not None and noise_sigma > 0 and sigma_fit > 0:
+        snr_amp_fit = A_fit / noise_sigma
+        flux_snr_conventional = snr_amp_fit * np.sqrt(sigma_fit * np.sqrt(np.pi))
+    else:
+        flux_snr_conventional = 0.0
+
+    return flux, flux_err, flux_snr, flux_snr_conventional
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +576,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
                                    if amplitude_snrs is not None and i < len(amplitude_snrs)
                                    else None)
 
-        flux, flux_err, flux_snr_from_fit = calculate_flux_snr_from_fit(
+        flux, flux_err, flux_snr_from_fit, flux_snr_conventional = calculate_flux_snr_from_fit(
             A_fit, A_err, sigma_fit, sigma_err, global_noise_sigma
         )
         flux_snr_pass = flux_snr_from_fit >= n_sigma_flux
@@ -593,7 +620,8 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             'snr_amplitude': snr_amp,
             'snr_amplitude_detection': detection_amplitude_snr,
             'flux': flux, 'flux_err': flux_err,
-            'flux_snr': flux_snr_from_fit, 'flux_snr_pass': flux_snr_pass,
+            'flux_snr': flux_snr_from_fit, 'flux_snr_conventional': flux_snr_conventional,
+            'flux_snr_pass': flux_snr_pass,
             'global_noise_sigma_used': global_noise_sigma or 0,
             'param_covariance': pcov,
             'fit_success': True,
@@ -815,6 +843,7 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             'Flux_From_Fit': float(flux_val) if flux_val is not None else np.nan,
             'Flux_Err': float(flux_err_val) if flux_err_val is not None else np.nan,
             'SNR_Flux_From_Fit': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
+            'SNR_Flux_Conventional': float(result.get('flux_snr_conventional', 0)),
         })
         pulse_data_list.append(pulse_data)
 

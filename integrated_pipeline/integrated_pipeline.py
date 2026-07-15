@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v6.0).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.4).
+
+v7.4: 新增 SNR_Flux_Conventional — 基于匹配滤波辐射计方程的传统流量 SNR
+  (=(A/σ_n)×√(σ×√π))，与 SNR_Flux_From_Fit（拟合质量指标）互补。CSV 输出新增
+  SNR_Flux_Conventional 列。计算在 pulse_detection_module.py 的
+  calculate_flux_snr_from_fit() 中完成。
 
 v6.0: merged v5a + v5b. Raw PSRFITS output as uint8 (PRESTO/DSPSR compat);
 DM-corrected FITS removed; raw headers DM=0 (REFFREQ/CHAN_DM omitted).
@@ -1632,7 +1637,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
         'Amplitude', 'Amp_Err', 'FWHM_ms', 'FWHM_Err', 'R_2',
         'Background_Level', 'Background_Fit', 'Noise_Sigma',
         'SNR_Amplitude_Fit', 'SNR_Amplitude_Detection',
-        'Flux_From_Fit', 'Flux_Err', 'SNR_Flux_From_Fit',
+        'Flux_From_Fit', 'Flux_Err', 'SNR_Flux_From_Fit', 'SNR_Flux_Conventional',
     ]
 
     if 'Precise_JD1' in df.columns and 'Precise_JD2' in df.columns:
@@ -1670,7 +1675,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.3")
+    print("  detecter_in_baseband  v7.4")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
