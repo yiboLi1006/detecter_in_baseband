@@ -194,7 +194,7 @@ def _create_lightcurve(data_2d):
 
 def _plot_single_pulse(original_data, corrected_data, center_idx, half_width,
                        fwhm_ms, raw_fits_name, corrected_fits_name, save_path,
-                       tbin_us, snr, pulse_index, freqs,
+                       tbin_us, snr_amp, snr_flux, pulse_index, freqs,
                        corrected_lightcurve, pulse_dict):
     """Generate a three-panel figure: raw waterfall, DM-corrected waterfall,
     and light curve with Gaussian fit overlay."""
@@ -344,7 +344,8 @@ def _plot_single_pulse(original_data, corrected_data, center_idx, half_width,
     fig.colorbar(im1, cax=cbar_ax, orientation='vertical').set_label('Intensity', fontsize=11)
 
     fig.suptitle(f"Pulse #{pulse_index}  |  "
-                 f"FWHM: {fwhm_ms:.4f} ms  |  SNR: {snr:.2f}",
+                 f"FWHM: {fwhm_ms:.4f} ms  |  "
+                 f"SNR_Amp={snr_amp:.2f}, SNR_Flux={snr_flux:.2f}",
                  fontsize=14, fontweight='bold', y=0.98)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -414,8 +415,8 @@ def plot_pulses_for_hdulist(raw_fits_path, corrected_fits_path,
     for idx, pulse in enumerate(pulse_data_list):
         center_idx = int(pulse.get('Precise_Center_Index', pulse.get('Coarse_Index', 0)))
         fwhm_ms = pulse.get('FWHM_ms', 0)
-        snr = pulse.get('SNR_Amplitude_Detection',
-                        pulse.get('SNR_Flux_From_Fit', 0))
+        snr_amp = pulse.get('SNR_Amplitude_Fit', 0)
+        snr_flux = pulse.get('SNR_Flux_Conventional', 0)
 
         if fwhm_ms <= 0:
             print(f"  pulse #{idx}: FWHM <= 0, skipping plot")
@@ -436,7 +437,7 @@ def plot_pulses_for_hdulist(raw_fits_path, corrected_fits_path,
                 original_data, corrected_data,
                 center_idx, half_width_px, fwhm_ms,
                 raw_fits_name, corrected_fits_name,
-                image_path, tbin_us, snr, idx, freqs,
+                image_path, tbin_us, snr_amp, snr_flux, idx, freqs,
                 corrected_lightcurve, pulse)
         except Exception as e:
             print(f"  WARNING: failed to plot pulse #{idx}: {e}")
