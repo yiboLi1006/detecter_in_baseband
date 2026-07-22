@@ -629,10 +629,12 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             'fit_data_range': (start_idx, end_idx),
         }
 
+        # 无论 flux_snr_pass 如何，始终追加 fit_result，
+        # 让 _extract_pulse_data_for_csv 通过 pulse_index 统一负责过滤。
+        fit_results.append(fit_result)
         if flux_snr_pass:
             precise_peaks.append(mu_fit)
             precise_times.append(relative_time_sec)
-            fit_results.append(fit_result)
 
     return np.array(precise_peaks), np.array(precise_times), fit_results
 
@@ -772,10 +774,13 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                        if len(final_times) > 1 else 1e-6)
     _, coarse_mjd_digits, _ = get_coarse_time_precision(time_resolution)
 
+    # 用 pulse_index 反查代替平行索引，避免 fit_results 与 peaks_detected 长度不一致导致错位
+    fit_map = {fr['pulse_index']: fr for fr in (fit_results or [])}
+
     for i, peak_idx in enumerate(peaks_detected):
-        if fit_results is None or i >= len(fit_results):
+        result = fit_map.get(i)
+        if result is None:
             continue
-        result = fit_results[i]
         snr_amp_det = result.get('snr_amplitude_detection', None)
         snr_flux_fit = result.get('flux_snr', None)
         fit_success = result.get('fit_success', False)
