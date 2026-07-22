@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.4).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.5).
+
+v7.5: 合并 v7.4.a + v7.4.b — 双线并行修复
+  - v7.4.a: open_data_file 新增 verify_frame 参数，支持从 INI [processing]
+    verify_frame=False 关闭帧校验（默认 True）。
+  - v7.4.b: 修复 precise_pulse_timing 中 fit_results 索引错位 bug —
+    用 pulse_index 反查代替平行索引，避免 flux_snr_pass=False 时
+    fit_results 与 peaks_detected 长度不一致导致的下游数据污染。
 
 v7.4: 新增 SNR_Flux_Conventional — 基于匹配滤波辐射计方程的传统流量 SNR
   (=(A/σ_n)×√(σ×√π))，与 SNR_Flux_From_Fit（拟合质量指标）互补。CSV 输出新增
