@@ -369,6 +369,7 @@ def read_config(config_file):
                                                fallback=512 * 32)
     params['nchans'] = config.getint('processing', 'nchans', fallback=512)
     params['calib_bandpass'] = config.getboolean('processing', 'calib_bandpass', fallback=True)
+    params['verify_frame'] = config.getboolean('processing', 'verify_frame', fallback=True)
     flag_band_edge_str = config.get('processing', 'flag_band_edge', fallback='2')
     try:
         params['flag_band_edge'] = int(flag_band_edge_str.strip())
@@ -1175,7 +1176,8 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
 # =========================================================================
 
 def open_data_file(data_file, data_format, withsubband, subset,
-                   sample_rate_value, ref_time_str=None, nchan=1):
+                   sample_rate_value, ref_time_str=None, nchan=1,
+                   verify_frame=True):
     if data_format == 'mark5b':
         ref_time = None
         if ref_time_str and ref_time_str.strip():
@@ -1191,18 +1193,18 @@ def open_data_file(data_file, data_format, withsubband, subset,
             return baseband.open(
                 data_file, mode='rs', format='mark5b', nchan=nchan,
                 sample_rate=sample_rate_value * u.Hz, subset=subset,
-                ref_time=ref_time, verify=True)
+                ref_time=ref_time, verify=verify_frame)
         return baseband.open(
             data_file, mode='rs', format='mark5b', nchan=nchan,
             sample_rate=sample_rate_value * u.Hz, ref_time=ref_time,
-            verify=True)
+            verify=verify_frame)
     if withsubband:
         return baseband.open(
             data_file, mode='rs', format='vdif', subset=subset,
-            verify=True, sample_rate=sample_rate_value * u.Hz)
+            verify=verify_frame, sample_rate=sample_rate_value * u.Hz)
     return baseband.open(
         data_file, mode='rs', format='vdif',
-        verify=True, sample_rate=sample_rate_value * u.Hz)
+        verify=verify_frame, sample_rate=sample_rate_value * u.Hz)
 
 
 def calculate_start_sample(file_counter, start_file, max_subints_per_file,
@@ -1234,6 +1236,7 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     flag_edge_channels=2, calibrate_flux=True,
                     calibrate_bandpass=True, bspline_degree=3, bspline_smooth=1.0,
                     data_format='vdif', ref_time_str='', nchan=1, start_file=0,
+                    verify_frame=True,
                     # ------------- v1 params ----------------
                     dm_value=None, dm_ref_freq=None,
                     detection_params=None,
@@ -1271,7 +1274,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
     data_reader = open_data_file(
         vdif_file, data_format, withsubband, subset,
-        sample_rate_value, ref_time_str, nchan)
+        sample_rate_value, ref_time_str, nchan,
+        verify_frame=verify_frame)
     if data_reader is None:
         print(f"Error opening data file: {vdif_file}")
         return
@@ -1437,7 +1441,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
                                 file_obj = open_data_file(
                                     vdif_file, data_format, withsubband, subset,
-                                    sample_rate_value, ref_time_str, nchan)
+                                    sample_rate_value, ref_time_str, nchan,
+                                    verify_frame=verify_frame)
                                 if file_obj is None:
                                     print("\n### WARN: failed to reopen baseband reader; aborting.")
                                     break
@@ -1528,6 +1533,7 @@ def _worker_process_range(worker_args):
             output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
             plot_output_dir=params.get('plot_output_dir') or None,
             cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
+            verify_frame=params.get('verify_frame', True),
             end_file=h_end,                         # v7: 全局 hdulist 上限（不含）
             return_pulses=True,                     # v7: 返回 pulse_list
             worker_label=worker_label,              # v7: 日志前缀
@@ -1547,7 +1553,8 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
     reader = open_data_file(
         params['vdif_file'], params['data_format'], params['withsubband'],
         params['subbands'], sample_rate_value,
-        params.get('ref_time', ''), params.get('nchan', 1))
+        params.get('ref_time', ''), params.get('nchan', 1),
+        verify_frame=params.get('verify_frame', True))
     if reader is None:
         print(f"Error opening data file: {params['vdif_file']}")
         return
@@ -1762,6 +1769,7 @@ if __name__ == "__main__":
             output_raw_psrfits_dir=params['output_raw_psrfits_dir'],
             plot_output_dir=params.get('plot_output_dir') or None,
             cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
+            verify_frame=params.get('verify_frame', True),
             end_file=None, return_pulses=False, worker_label=None,
         )
 
