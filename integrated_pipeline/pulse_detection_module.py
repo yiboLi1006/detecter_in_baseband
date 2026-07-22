@@ -579,7 +579,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         flux, flux_err, flux_snr_from_fit, flux_snr_conventional = calculate_flux_snr_from_fit(
             A_fit, A_err, sigma_fit, sigma_err, global_noise_sigma
         )
-        flux_snr_pass = flux_snr_from_fit >= n_sigma_flux
+        flux_snr_pass = flux_snr_conventional >= n_sigma_flux
 
         absolute_time_obj = None
         jd1 = jd2 = None
@@ -783,9 +783,10 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             continue
         snr_amp_det = result.get('snr_amplitude_detection', None)
         snr_flux_fit = result.get('flux_snr', None)
+        snr_flux_conv = result.get('flux_snr_conventional', 0)
         fit_success = result.get('fit_success', False)
-        if not (fit_success and snr_amp_det is not None and snr_flux_fit is not None
-                and snr_amp_det >= n_sigma_amplitude and snr_flux_fit >= n_sigma_flux):
+        if not (fit_success and snr_amp_det is not None
+                and snr_amp_det >= n_sigma_amplitude and snr_flux_conv >= n_sigma_flux):
             continue
 
         rel_time_ms_txt = coarse_relative_times_rounded[i] * 1000
@@ -848,7 +849,7 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             'Flux_From_Fit': float(flux_val) if flux_val is not None else np.nan,
             'Flux_Err': float(flux_err_val) if flux_err_val is not None else np.nan,
             'SNR_Flux_From_Fit': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
-            'SNR_Flux_Conventional': float(result.get('flux_snr_conventional', 0)),
+            'SNR_Flux': float(snr_flux_conv),
         })
         pulse_data_list.append(pulse_data)
 

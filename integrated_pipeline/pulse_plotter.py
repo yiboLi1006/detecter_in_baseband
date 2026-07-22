@@ -416,7 +416,7 @@ def plot_pulses_for_hdulist(raw_fits_path, corrected_fits_path,
         center_idx = int(pulse.get('Precise_Center_Index', pulse.get('Coarse_Index', 0)))
         fwhm_ms = pulse.get('FWHM_ms', 0)
         snr_amp = pulse.get('SNR_Amplitude_Fit', 0)
-        snr_flux = pulse.get('SNR_Flux_Conventional', 0)
+        snr_flux = pulse.get('SNR_Flux', 0)
 
         if fwhm_ms <= 0:
             print(f"  pulse #{idx}: FWHM <= 0, skipping plot")
