@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.9).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
 v7.9: 合并 v7.6.1 + v7.7.1 双修复 —
   (1) R² > 0.1 拟合质量筛选，防假脉冲通过辐射计方程 SNR。
@@ -152,6 +152,8 @@ from pulse_detection_module import detect_pulses_in_hdulist
 from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+__version__ = "v7.9"
 
 
 # =========================================================================
@@ -438,9 +440,9 @@ def read_config(config_file):
     else:
         output_base = './output'
     ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    params['csv_output_path'] = os.path.join(output_base, f'pulse_detection_{ts}.csv')
-    params['output_raw_psrfits_dir'] = os.path.join(output_base, f'pulse_psrfits_vdif_{ts}')
-    params['plot_output_dir'] = os.path.join(output_base, f'pulse_plots_{ts}')
+    params['csv_output_path'] = os.path.join(output_base, f'pulse_detection_{__version__}_{ts}.csv')
+    params['output_raw_psrfits_dir'] = os.path.join(output_base, f'pulse_psrfits_vdif_{__version__}_{ts}')
+    params['plot_output_dir'] = os.path.join(output_base, f'pulse_plots_{__version__}_{ts}')
 
     # -- performance (v2) --
     if config.has_section('performance'):
@@ -1719,7 +1721,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.9")
+    print(f"  detecter_in_baseband  {__version__}")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
