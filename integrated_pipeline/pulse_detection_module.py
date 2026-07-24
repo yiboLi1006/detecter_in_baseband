@@ -480,7 +480,8 @@ def get_coarse_time_precision(time_resolution):
 def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_info,
                          time_resolution, method='base', fit_window_factor=3.0,
                          global_noise_sigma=None, amplitude_snrs=None,
-                         n_sigma_flux=3.0, tbin=None, date_obs_iso=None,
+                         n_sigma_flux=3.0, n_sigma_fit_quality=3.0,
+                         tbin=None, date_obs_iso=None,
                          offs_sub_arr=None, tsubint_arr=None):
     precise_peaks = []
     precise_times = []
@@ -526,20 +527,10 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         p0 = [amplitude_init, mu_init, sigma_init, background_init]
         tolerance = max(1, (end_idx - start_idx) * 0.15)
 
-        # 振幅上界：以检测峰位置的实际值为基准，防止采样偏移导致的 A 爆炸
-        _peak_relative = peak_idx - start_idx
-        if 0 <= _peak_relative < len(y_data):
-            _peak_val = y_data[_peak_relative]
-            _peak_above_bg = max(_peak_val - background_init, amplitude_init, 1e-6)
-        else:
-            _peak_above_bg = max(np.nanmax(y_data) - background_init, amplitude_init, 1e-6)
-        amplitude_upper = max(_peak_above_bg * 1.5, 1e-6)
-
-        window_width = end_idx - start_idx  # 样本数
         bounds = (
-            [0, start_idx - tolerance, 0.1, 0],            # sigma 下界 0.1 样本
-            [amplitude_upper, end_idx - 1 + tolerance,
-             window_width, np.inf],                          # sigma 上界 ≤ 窗口宽度
+            [0, start_idx - tolerance, time_resolution / 10, 0],
+            [np.inf, end_idx - 1 + tolerance,
+             (end_idx - start_idx) * time_resolution, np.inf],
         )
 
         try:
@@ -591,7 +582,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             A_fit, A_err, sigma_fit, sigma_err, global_noise_sigma
         )
         flux_snr_pass = (flux_snr_conventional >= n_sigma_flux
-                         and r_squared > 0.1)
+                         and flux_snr_from_fit >= n_sigma_fit_quality)
 
         absolute_time_obj = None
         jd1 = jd2 = None
@@ -632,7 +623,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             'snr_amplitude': snr_amp,
             'snr_amplitude_detection': detection_amplitude_snr,
             'flux': flux, 'flux_err': flux_err,
-            'flux_snr': flux_snr_from_fit, 'flux_snr_conventional': flux_snr_conventional,
+            'Fit-quality_SNR': flux_snr_from_fit, 'flux_snr_conventional': flux_snr_conventional,
             'flux_snr_pass': flux_snr_pass,
             'global_noise_sigma_used': global_noise_sigma or 0,
             'param_covariance': pcov,
@@ -777,7 +768,8 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                                 background_level, noise_sigma,
                                 coarse_relative_times_rounded, coarse_absolute_mjd,
                                 coarse_utc_times,
-                                n_sigma_amplitude, n_sigma_flux):
+                                n_sigma_amplitude, n_sigma_flux,
+                                n_sigma_fit_quality):
     pulse_data_list = []
     if len(peaks_detected) == 0:
         return pulse_data_list
@@ -794,13 +786,14 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
         if result is None:
             continue
         snr_amp_det = result.get('snr_amplitude_detection', None)
-        snr_flux_fit = result.get('flux_snr', None)
+        snr_flux_fit = result.get('Fit-quality_SNR', None)
         snr_flux_conv = result.get('flux_snr_conventional', 0)
+        snr_fit_quality = result.get('Fit-quality_SNR', 0)
         fit_success = result.get('fit_success', False)
         if not (fit_success and snr_amp_det is not None
                 and snr_amp_det >= n_sigma_amplitude
                 and snr_flux_conv >= n_sigma_flux
-                and result.get('r_squared', 0) > 0.1):
+                and snr_fit_quality >= n_sigma_fit_quality):
             continue
 
         rel_time_ms_txt = coarse_relative_times_rounded[i] * 1000
@@ -862,7 +855,7 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             'SNR_Amplitude_Detection': float(snr_amp_det) if snr_amp_det is not None else np.nan,
             'Flux_From_Fit': float(flux_val) if flux_val is not None else np.nan,
             'Flux_Err': float(flux_err_val) if flux_err_val is not None else np.nan,
-            'SNR_Flux_From_Fit': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
+            'Fit-quality_SNR': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
             'SNR_Flux': float(snr_flux_conv),
         })
         pulse_data_list.append(pulse_data)
@@ -889,6 +882,7 @@ def detect_pulses_in_hdulist(hdulist, params):
     """
     n_sigma_amplitude = params['amp_snr_threshold']
     n_sigma_flux = params['flux_snr_threshold']
+    n_sigma_fit_quality = params.get('fit_quality_snr_threshold', 3.0)
     peak_distance = params.get('peak_distance')
     sigma_rfi_freq = params['sigma_remove_rfi_frequency']
     sigma_rfi_tf = params['sigma_remove_rfi_time_frequency']
@@ -962,6 +956,7 @@ def detect_pulses_in_hdulist(hdulist, params):
         global_noise_sigma=sigma_final,
         amplitude_snrs=amplitude_snrs_detected,
         n_sigma_flux=n_sigma_flux,
+        n_sigma_fit_quality=n_sigma_fit_quality,
         tbin=obs_info['tbin'],
         date_obs_iso=date_obs_iso,
         offs_sub_arr=offs_sub_arr,
@@ -988,7 +983,9 @@ def detect_pulses_in_hdulist(hdulist, params):
         peaks_detected, final_times, date_obs_iso, fit_results,
         M_final, sigma_final,
         coarse_relative_times_rounded, coarse_absolute_mjd, coarse_utc_times,
-        n_sigma_amplitude=n_sigma_amplitude, n_sigma_flux=n_sigma_flux,
+        n_sigma_amplitude=n_sigma_amplitude,
+        n_sigma_flux=n_sigma_flux,
+        n_sigma_fit_quality=n_sigma_fit_quality,
     )
     # v7.8: 脉冲计数改为 integrated_pipeline 进度行实时刷新
 

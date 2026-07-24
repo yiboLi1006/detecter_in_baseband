@@ -2,6 +2,9 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v7.10: 三重 SNR 筛选体系 — 删除振幅上界和 R² 检查，回归简洁拟合+
+  Fit-quality_SNR(=flux/flux_err) 天然筛选。INI 新增 Fit-quality_SNR 参数。
+
 v7.9: 合并 v7.6.1 + v7.7.1 双修复 —
   (1) R² > 0.1 拟合质量筛选，防假脉冲通过辐射计方程 SNR。
   (2) fallback 拟合恢复无边界，解决 sigma 初值(样本) ≠ 边界(秒)
@@ -153,7 +156,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.9"
+__version__ = "v7.10"
 
 
 # =========================================================================
@@ -415,6 +418,7 @@ def read_config(config_file):
     if config.has_section('detection'):
         params['amp_snr_threshold'] = config.getfloat('detection', 'amp_snr_threshold', fallback=4.0)
         params['flux_snr_threshold'] = config.getfloat('detection', 'flux_snr_threshold', fallback=4.0)
+        params['fit_quality_snr_threshold'] = config.getfloat('detection', 'Fit-quality_SNR', fallback=3.0)
         params['peak_distance'] = config.getint('detection', 'peak_distance', fallback=5000)
         params['sigma_remove_rfi_frequency'] = config.getfloat(
             'detection', 'sigma_remove_rfi_frequency', fallback=5.0)
@@ -423,6 +427,7 @@ def read_config(config_file):
     else:
         params['amp_snr_threshold'] = 4.0
         params['flux_snr_threshold'] = 4.0
+        params['fit_quality_snr_threshold'] = 3.0
         params['peak_distance'] = 5000
         params['sigma_remove_rfi_frequency'] = 5.0
         params['sigma_remove_rfi_time_frequency'] = 9.0
@@ -1684,7 +1689,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
         'Amplitude', 'Amp_Err', 'FWHM_ms', 'FWHM_Err', 'R_2',
         'Background_Level', 'Background_Fit', 'Noise_Sigma',
         'SNR_Amplitude_Fit', 'SNR_Amplitude_Detection',
-        'Flux_From_Fit', 'Flux_Err', 'SNR_Flux_From_Fit', 'SNR_Flux',
+        'Flux_From_Fit', 'Flux_Err', 'Fit-quality_SNR', 'SNR_Flux',
     ]
 
     if 'Precise_JD1' in df.columns and 'Precise_JD2' in df.columns:
@@ -1748,6 +1753,7 @@ if __name__ == "__main__":
     detection_params = {
         'amp_snr_threshold': params['amp_snr_threshold'],
         'flux_snr_threshold': params['flux_snr_threshold'],
+        'fit_quality_snr_threshold': params['fit_quality_snr_threshold'],
         'peak_distance': params['peak_distance'],
         'sigma_remove_rfi_frequency': params['sigma_remove_rfi_frequency'],
         'sigma_remove_rfi_time_frequency': params['sigma_remove_rfi_time_frequency'],
