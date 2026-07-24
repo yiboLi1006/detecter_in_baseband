@@ -319,7 +319,6 @@ def read_config(config_file):
     params = {}
 
     # -- paths --
-    params['output_dir'] = config.get('paths', 'output_dir', fallback='./presto_fits')
     params['vdif_file'] = config.get('paths', 'vdif_file',
                                      fallback='./ywwu_data/p51015_km_no0009.vdif')
     params['data_format'] = config.get('paths', 'data_format',
@@ -430,23 +429,15 @@ def read_config(config_file):
         raw_str = ''
     params['detection_freq_mask_ranges'] = _parse_freq_mask_ranges(raw_str)
 
-    # -- integrated_output --
+    # -- integrated_output (v7.8: 整合为单一 output_path，自动生成子路径+时间戳) --
     if config.has_section('integrated_output'):
-        params['csv_output_path'] = config.get('integrated_output', 'csv_output_path',
-                                               fallback='./pulse_csv_results')
-        params['output_raw_psrfits_dir'] = config.get('integrated_output',
-                                                      'output_raw_psrfits_dir',
-                                                      fallback='./pulse_psrfits_raw')
-        params['output_corrected_psrfits_dir'] = config.get('integrated_output',
-                                                            'output_corrected_psrfits_dir',
-                                                            fallback='./pulse_psrfits_corrected')
-        params['plot_output_dir'] = config.get('integrated_output', 'plot_output_dir',
-                                               fallback='')
+        output_base = config.get('integrated_output', 'output_path', fallback='./output')
     else:
-        params['csv_output_path'] = './pulse_csv_results'
-        params['output_raw_psrfits_dir'] = './pulse_psrfits_raw'
-        params['output_corrected_psrfits_dir'] = './pulse_psrfits_corrected'
-        params['plot_output_dir'] = ''
+        output_base = './output'
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    params['csv_output_path'] = os.path.join(output_base, f'pulse_detection_{ts}.csv')
+    params['output_raw_psrfits_dir'] = os.path.join(output_base, f'pulse_psrfits_vdif_{ts}')
+    params['plot_output_dir'] = os.path.join(output_base, f'pulse_plots_{ts}')
 
     # -- performance (v2) --
     if config.has_section('performance'):
@@ -1246,7 +1237,7 @@ def calculate_start_sample(file_counter, start_file, max_subints_per_file,
 # gc.collect + malloc_trim every N hdulists.
 # =========================================================================
 
-def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
+def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                     nchans=512, dm=0.0, source_name="B0531+21", telescope='Badary',
                     chunk_size=2 ** 25, center_freq=2248.9, nband=1, bandwidth=96.0,
                     max_subints_per_file=128, max_files=100,
@@ -1530,7 +1521,6 @@ def _worker_process_range(worker_args):
     try:
         pulse_list = vdif_to_psrfits(
             vdif_file=params['vdif_file'],
-            output_dir=params['output_dir'],
             reduction_factor=params['reduction_factor'],
             subset=params['subbands'],
             nchans=params['nchans'],
@@ -1705,18 +1695,17 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
     existing_columns = [c for c in column_order if c in df.columns]
     df = df[existing_columns]
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # v7.8: csv_path 已包含时间戳，直接用
     csv_dir = os.path.dirname(csv_base_path)
     if csv_dir:
         os.makedirs(csv_dir, exist_ok=True)
-    csv_filename = f"{os.path.splitext(csv_base_path)[0]}_{timestamp}.csv"
-    df.to_csv(csv_filename, index=False)
+    df.to_csv(csv_base_path, index=False)
 
     print("\n" + "=" * 60)
-    print(f"CSV OUTPUT: {csv_filename}")
+    print(f"CSV OUTPUT: {csv_base_path}")
     print(f"Total pulses recorded: {len(df)}")
     print("=" * 60)
-    return csv_filename
+    return csv_base_path
 
 
 # =========================================================================
@@ -1776,7 +1765,6 @@ if __name__ == "__main__":
         # ---------- 单进程路径（v6.1 完全兼容）----------
         vdif_to_psrfits(
             vdif_file=params['vdif_file'],
-            output_dir=params['output_dir'],
             reduction_factor=params['reduction_factor'],
             subset=params['subbands'],
             nchans=params['nchans'],
