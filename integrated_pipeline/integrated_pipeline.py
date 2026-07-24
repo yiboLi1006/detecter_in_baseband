@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.7).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.8).
+
+v7.8: 进度显示重构 — 不显示子进程区间/进度细节，统一用 hdulist 百分比
+  实时单行刷新。多进程模式通过 multiprocessing.Manager 共享计数器统计
+  全局完成百分比；单进程模式原地计算 hdulist 完成比例。
 
 v7.7: 高斯拟合振幅 A 添加上界约束 — 拟合峰高 (A+background) 不超过
   原始数据峰值 (y_data.max()) 的 1.2 倍，防止窄尖刺（RFI 残余、单 bin
@@ -128,6 +132,7 @@ import warnings
 import configparser
 import gc
 import ctypes
+from multiprocessing import Manager
 
 import numpy as np
 import pandas as pd
@@ -1263,7 +1268,8 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                     # ------------- v7 params ----------------
                     end_file=None,          # 全局 hdulist 上限（不含）；None 退回 max_files
                     return_pulses=False,    # True: 不内部写 csv，返回 pulse_list
-                    worker_label=None):     # 日志前缀 "[worker i]"；None 无前缀
+                    worker_label=None,      # 日志前缀 "[worker i]"；None 无前缀
+                    shared_hdulist_counter=None):  # Manager.Value('i') 多进程全局 hdulist 计数
     """Integrated VDIF -> DM correction -> pulse detection -> CSV pipeline (v2)."""
     pulsar_coords = {
         "B0531+21": SkyCoord('05h34m31.97s', '+22d00m52.1s', frame='icrs'),
@@ -1329,6 +1335,13 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
         total_chunks_planned = max(1, int(math.ceil(total_samples / chunk_size)))
         chunks_processed = 0
+
+        # v7.8: hdulist 总数，用于进度百分比（单进程模式）
+        total_hdulists_planned = min(
+            hdulist_hard_limit - start_file,
+            max(1, int(math.ceil(total_chunks_planned / max_subints_per_file)))
+        )
+        hdulists_completed = 0
 
         subint_data_list = []
         subint_times_list = []
@@ -1422,19 +1435,17 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
 
                         file_counter += 1
 
-                        # progress at hdulist boundary (单进程原地刷新；多进程由主进程汇总行刷新)
-                        if not worker_label:
-                            pct_h = 100.0 * chunks_processed / total_chunks_planned
-                            rss_str = ''
-                            if _HAS_PSUTIL:
-                                try:
-                                    rss_str = f'  RSS={_psutil.Process().memory_info().rss / (1 << 30):.2f}GiB'
-                                except Exception:
-                                    pass
+                        # v7.8: 统一用 hdulist 进度百分比，单行原地刷新
+                        hdulists_completed += 1
+                        if shared_hdulist_counter is not None:
+                            # 多进程模式：只递增全局计数器，不在此打印
+                            shared_hdulist_counter.value += 1
+                        else:
+                            # 单进程模式：原地刷新百分比进度行
+                            pct_h = 100.0 * hdulists_completed / total_hdulists_planned
                             print(f"\r### progress: {pct_h:.1f}%  "
-                                  f"hdulist #{file_counter - 1}  "
-                                  f"chunk {chunks_processed}/{total_chunks_planned}"
-                                  f"  pulses: {n_pulses}{rss_str}  ",
+                                  f"hdulist {hdulists_completed}/{total_hdulists_planned}"
+                                  f"  pulses: {n_pulses}  ",
                                   end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
@@ -1507,7 +1518,6 @@ def _worker_process_range(worker_args):
     dm_ref_freq = worker_args['dm_ref_freq']
 
     worker_label = f"[worker {worker_idx}]"
-    print(f"{worker_label} start: hdulist [{h_start}, {h_end})")
 
     try:
         pulse_list = vdif_to_psrfits(
@@ -1552,6 +1562,7 @@ def _worker_process_range(worker_args):
             end_file=h_end,                         # v7: 全局 hdulist 上限（不含）
             return_pulses=True,                     # v7: 返回 pulse_list
             worker_label=worker_label,              # v7: 日志前缀
+            shared_hdulist_counter=worker_args.get('shared_hdulist_counter'),
         ) or []
         return (worker_idx, pulse_list)
     except Exception as e:
@@ -1582,26 +1593,35 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
     m = max(1, math.ceil(total_chunks / max_subints))           # 全局 hdulist 数
     n_workers = min(n_processes, m)                             # n>m 时多余不启动
     bounds = [(i * m // n_workers, (i + 1) * m // n_workers) for i in range(n_workers)]
-    print(f"### v7 multiprocess: m={m} hdulists, n_processes={n_processes}, "
-          f"n_workers={n_workers}, ranges={bounds}")
+    print(f"### v7.8 multiprocess: m={m} hdulists, n_processes={n_processes}, "
+          f"n_workers={n_workers}")
+
+    # v7.8: Manager 共享计数器，worker 每完成一个 hdulist 递增
+    _manager = Manager()
+    shared_counter = _manager.Value('i', 0)
 
     worker_args = [{'worker_idx': i, 'h_start': hs, 'h_end': he,
                     'params': params, 'detection_params': detection_params,
-                    'dm_ref_freq': dm_ref_freq} for i, (hs, he) in enumerate(bounds)]
+                    'dm_ref_freq': dm_ref_freq,
+                    'shared_hdulist_counter': shared_counter}
+                   for i, (hs, he) in enumerate(bounds)]
 
-    # v7: daemon 进度/内存监控线程，原地刷新一行总进度（避免多 worker 刷屏）
+    # v7.8: daemon 监控线程，按 hdulist 百分比原地刷新
     import threading
     stop_mon = threading.Event()
-    state = {'done': 0, 'pulses': 0}   # 主进程内线程共享（GIL 保证原子）
+    state = {'pulses': 0}   # 主进程内线程共享（GIL 保证原子）
 
     def _monitor():
-        while not stop_mon.wait(5.0):
+        while not stop_mon.wait(3.0):
+            done = shared_counter.value
+            pct_m = 100.0 * done / m if m > 0 else 0
             info = _get_total_rss_percent()
             mem_str = ''
             if info:
                 rss_gib, sys_gib, pct = info
                 mem_str = f" | total RSS: {rss_gib:.2f}/{sys_gib:.1f} GiB ({pct:.1f}%)"
-            print(f"\r### progress: workers {state['done']}/{n_workers} done | "
+            print(f"\r### progress: {pct_m:.1f}%  "
+                  f"hdulist {done}/{m}  "
                   f"pulses: {state['pulses']}{mem_str}   ",
                   end='', flush=True)
 
@@ -1619,15 +1639,14 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
                 wid = futures[fut]
                 try:
                     _idx, plist = fut.result()
-                    state['done'] += 1
                     if plist:
                         state['pulses'] += len(plist)
                         global_pulses.extend(plist)
                 except Exception as e:
-                    state['done'] += 1
                     print(f"\n### v7 worker {wid} crashed: {e}")
     finally:
         stop_mon.set()   # 停止监控
+        _manager.shutdown()
     print()  # 结束原地刷新行
 
     # v7: 合并后按 Precise_Abs_MJD_Str 排序（全局时间序）
@@ -1697,7 +1716,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.7")
+    print("  detecter_in_baseband  v7.8")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
