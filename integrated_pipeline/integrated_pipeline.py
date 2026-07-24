@@ -1325,6 +1325,9 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
               f"file shape: {file_obj.shape}")
         _log_rss(tag='startup')
 
+        # v7.8: 计时起点，用于进度行显示已运行时间
+        t_proc_start = time.time()
+
         start_sample, file_counter, global_offset = calculate_start_sample(
             0, start_file, max_subints_per_file, chunk_size,
             actual_sample_rate, t_start,
@@ -1443,9 +1446,14 @@ def vdif_to_psrfits(vdif_file, output_dir, reduction_factor=32, subset=[0],
                         else:
                             # 单进程模式：原地刷新百分比进度行
                             pct_h = 100.0 * hdulists_completed / total_hdulists_planned
+                            elapsed = (time.time() - t_proc_start) / 60.0
+                            mem_str = ''
+                            info = _get_total_rss_percent()
+                            if info:
+                                mem_str = f'  mem: {info[2]:.1f}%'
                             print(f"\r### progress: {pct_h:.1f}%  "
-                                  f"hdulist {hdulists_completed}/{total_hdulists_planned}"
-                                  f"  pulses: {n_pulses}  ",
+                                  f"pulses: {n_pulses}{mem_str}  "
+                                  f"{elapsed:.1f}min  ",
                                   end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
@@ -1610,19 +1618,20 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
     import threading
     stop_mon = threading.Event()
     state = {'pulses': 0}   # 主进程内线程共享（GIL 保证原子）
+    t_proc_start = time.time()
 
     def _monitor():
         while not stop_mon.wait(3.0):
             done = shared_counter.value
             pct_m = 100.0 * done / m if m > 0 else 0
+            elapsed = (time.time() - t_proc_start) / 60.0
             info = _get_total_rss_percent()
             mem_str = ''
             if info:
-                rss_gib, sys_gib, pct = info
-                mem_str = f" | total RSS: {rss_gib:.2f}/{sys_gib:.1f} GiB ({pct:.1f}%)"
+                mem_str = f'  mem: {info[2]:.1f}%'
             print(f"\r### progress: {pct_m:.1f}%  "
-                  f"hdulist {done}/{m}  "
-                  f"pulses: {state['pulses']}{mem_str}   ",
+                  f"pulses: {state['pulses']}{mem_str}  "
+                  f"{elapsed:.1f}min  ",
                   end='', flush=True)
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
