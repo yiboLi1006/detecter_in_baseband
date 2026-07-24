@@ -530,23 +530,11 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         # background >= 0 约束下，保守取 A <= y_data.max() * 1.2
         amplitude_upper = max(y_data.max() * 1.2, amplitude_init, 1e-6)
 
-        # DEBUG v7.7.1: 诊断振幅上界 NaN 问题
-        print(f"[DEBUG v7.7.1] peak#{i} idx={peak_idx}: "
-              f"y_max={y_data.max():.4f} nanmax={np.nanmax(y_data):.4f} "
-              f"bg_init={background_init:.4f} amp_init={amplitude_init:.4f} "
-              f"amp_upper={amplitude_upper:.4f} "
-              f"n_nan={np.sum(np.isnan(y_data))}/{len(y_data)}",
-              flush=True)
-
         bounds = (
             [0, start_idx - tolerance, time_resolution / 10, 0],
             [amplitude_upper, end_idx - 1 + tolerance,
              (end_idx - start_idx) * time_resolution, np.inf],
         )
-
-        print(f"[DEBUG v7.7.1] p0={p0}", flush=True)
-        print(f"[DEBUG v7.7.1] bounds_low={bounds[0]}", flush=True)
-        print(f"[DEBUG v7.7.1] bounds_high={bounds[1]}", flush=True)
 
         try:
             result = curve_fit(gaussian_pulse, x_data, y_data, p0=p0, bounds=bounds,
@@ -560,8 +548,6 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
                 if not (start_idx <= mu_fit <= end_idx - 1):
                     raise ValueError("Invalid center position from unconstrained fit")
             except Exception as e2:
-                print(f"[DEBUG v7.7.1] peak#{i} FAIL: "
-                      f"constrained={e}, unconstrained={e2}", flush=True)
                 fit_results.append({
                     'pulse_index': i, 'coarse_peak_idx': peak_idx,
                     'precise_peak_idx': float(peak_idx),
@@ -599,10 +585,6 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             A_fit, A_err, sigma_fit, sigma_err, global_noise_sigma
         )
         flux_snr_pass = flux_snr_conventional >= n_sigma_flux
-
-        print(f"[DEBUG v7.7.1] peak#{i}: fit_ok A={A_fit:.4f} σ={sigma_fit:.4f} "
-              f"R²={r_squared:.4f} SNR_flux={flux_snr_conventional:.2f} "
-              f"pass={flux_snr_pass}", flush=True)
 
         absolute_time_obj = None
         jd1 = jd2 = None
