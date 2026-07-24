@@ -982,7 +982,7 @@ def detect_pulses_in_hdulist(hdulist, params):
         coarse_relative_times_rounded, coarse_absolute_mjd, coarse_utc_times,
         n_sigma_amplitude=n_sigma_amplitude, n_sigma_flux=n_sigma_flux,
     )
-    print(f"Detected {len(pulse_data_list)} pulses passing both SNR thresholds.")
+    # v7.8: 脉冲计数改为 integrated_pipeline 进度行实时刷新
 
     # Drop heavy intermediates before returning (param_covariance arrays inside
     # fit_results were the largest accumulation per call)

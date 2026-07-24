@@ -1336,6 +1336,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
             max(1, int(math.ceil(total_chunks_planned / max_subints_per_file)))
         )
         hdulists_completed = 0
+        cumulative_pulses = 0
 
         subint_data_list = []
         subint_times_list = []
@@ -1418,6 +1419,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             version_for_file=version,
                             plot_output_dir=plot_output_dir,
                         )
+                        cumulative_pulses += n_pulses
 
                         # v2 L2: del the big lists, then re-create empty ones
                         del subint_data_list, subint_times_list
@@ -1443,8 +1445,8 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             if info:
                                 mem_str = f'  mem: {info[2]:.1f}%'
                             print(f"\r### progress: {pct_h:.1f}%  "
-                                  f"pulses: {n_pulses}{mem_str}  "
-                                  f"{elapsed:.1f}min  ",
+                                  f"{cumulative_pulses} pulses had been detected"
+                                  f"{mem_str}  {elapsed:.1f}min  ",
                                   end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
@@ -1620,8 +1622,8 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
             if info:
                 mem_str = f'  mem: {info[2]:.1f}%'
             print(f"\r### progress: {pct_m:.1f}%  "
-                  f"pulses: {state['pulses']}{mem_str}  "
-                  f"{elapsed:.1f}min  ",
+                  f"{state['pulses']} pulses had been detected"
+                  f"{mem_str}  {elapsed:.1f}min  ",
                   end='', flush=True)
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
