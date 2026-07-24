@@ -526,8 +526,14 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         p0 = [amplitude_init, mu_init, sigma_init, background_init]
         tolerance = max(1, (end_idx - start_idx) * 0.15)
 
-        # 振幅上界：拟合峰高 A+background 不应超过原始数据峰值的 1.2 倍
-        amplitude_upper = max(y_data.max() * 1.2, amplitude_init, 1e-6)
+        # 振幅上界：以检测峰位置的实际值为基准，防止采样偏移导致的 A 爆炸
+        _peak_relative = peak_idx - start_idx
+        if 0 <= _peak_relative < len(y_data):
+            _peak_val = y_data[_peak_relative]
+            _peak_above_bg = max(_peak_val - background_init, amplitude_init, 1e-6)
+        else:
+            _peak_above_bg = max(np.nanmax(y_data) - background_init, amplitude_init, 1e-6)
+        amplitude_upper = max(_peak_above_bg * 3.0, 1e-6)
 
         window_width = end_idx - start_idx  # 样本数
         bounds = (
