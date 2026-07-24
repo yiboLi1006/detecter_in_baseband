@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.7).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.7.1 DEBUG).
 
+v7.7.1: 诊断版本 — 在 precise_pulse_timing 中增加三处 debug 打印，
+  输出每个候选峰的拟合窗口数据状态、拟合成败原因、SNR 筛选结果。
 v7.7: 高斯拟合振幅 A 添加上界约束 — 拟合峰高 (A+background) 不超过
   原始数据峰值 (y_data.max()) 的 1.2 倍，防止窄尖刺（RFI 残余、单 bin
   噪声涨落）被拟合为瘦高假脉冲。fallback 无约束拟合同步加上相同边界。
@@ -1697,7 +1699,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.7")
+    print("  detecter_in_baseband  v7.7.1 DEBUG")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
