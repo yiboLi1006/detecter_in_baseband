@@ -585,7 +585,8 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         flux, flux_err, flux_snr_from_fit, flux_snr_conventional = calculate_flux_snr_from_fit(
             A_fit, A_err, sigma_fit, sigma_err, global_noise_sigma
         )
-        flux_snr_pass = flux_snr_conventional >= n_sigma_flux
+        flux_snr_pass = (flux_snr_conventional >= n_sigma_flux
+                         and r_squared > 0.1)
 
         absolute_time_obj = None
         jd1 = jd2 = None
@@ -792,7 +793,9 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
         snr_flux_conv = result.get('flux_snr_conventional', 0)
         fit_success = result.get('fit_success', False)
         if not (fit_success and snr_amp_det is not None
-                and snr_amp_det >= n_sigma_amplitude and snr_flux_conv >= n_sigma_flux):
+                and snr_amp_det >= n_sigma_amplitude
+                and snr_flux_conv >= n_sigma_flux
+                and result.get('r_squared', 0) > 0.1):
             continue
 
         rel_time_ms_txt = coarse_relative_times_rounded[i] * 1000

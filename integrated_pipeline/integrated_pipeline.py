@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.8).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.9).
+
+v7.9: 合并 v7.6.1 + v7.7.1 双修复 —
+  (1) R² > 0.1 拟合质量筛选，防假脉冲通过辐射计方程 SNR。
+  (2) fallback 拟合恢复无边界，解决 sigma 初值(样本) ≠ 边界(秒)
+      致主拟合越界后 fallback 也失败的全部脉冲漏检问题。
 
 v7.8: 进度显示重构 — 不显示子进程区间/进度细节，统一用 hdulist 百分比
   实时单行刷新。多进程模式通过 multiprocessing.Manager 共享计数器统计
@@ -9,7 +14,6 @@ v7.8: 进度显示重构 — 不显示子进程区间/进度细节，统一用 h
 v7.7: 高斯拟合振幅 A 添加上界约束 — 拟合峰高 (A+background) 不超过
   原始数据峰值 (y_data.max()) 的 1.2 倍，防止窄尖刺（RFI 残余、单 bin
   噪声涨落）被拟合为瘦高假脉冲。fallback 无约束拟合同步加上相同边界。
-
 v7.6: 流量 SNR 筛选统一使用 SNR_Flux_Conventional（传统辐射计方程）替代
   SNR_Flux_From_Fit（拟合质量 SNR）。CSV 中 SNR_Flux_Conventional 列重命名为
   SNR_Flux，SNR_Flux_From_Fit 保留为诊断列。图中标注不变（沿用 SNR_Flux）。
@@ -1716,7 +1720,11 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
+<<<<<<< HEAD
     print("  detecter_in_baseband  v7.8")
+=======
+    print("  detecter_in_baseband  v7.6.1")
+>>>>>>> v7.6.1
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
