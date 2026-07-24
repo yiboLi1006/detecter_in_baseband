@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.6).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.7).
+
+v7.7: 高斯拟合振幅 A 添加上界约束 — 拟合峰高 (A+background) 不超过
+  原始数据峰值 (y_data.max()) 的 1.2 倍，防止窄尖刺（RFI 残余、单 bin
+  噪声涨落）被拟合为瘦高假脉冲。fallback 无约束拟合同步加上相同边界。
 
 v7.6: 流量 SNR 筛选统一使用 SNR_Flux_Conventional（传统辐射计方程）替代
   SNR_Flux_From_Fit（拟合质量 SNR）。CSV 中 SNR_Flux_Conventional 列重命名为
@@ -1693,7 +1697,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.6")
+    print("  detecter_in_baseband  v7.7")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()

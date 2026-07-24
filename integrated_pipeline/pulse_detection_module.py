@@ -525,9 +525,14 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
 
         p0 = [amplitude_init, mu_init, sigma_init, background_init]
         tolerance = max(1, (end_idx - start_idx) * 0.15)
+
+        # 振幅上界：拟合峰高 A+background 不应超过原始数据峰值的 1.2 倍
+        # background >= 0 约束下，保守取 A <= y_data.max() * 1.2
+        amplitude_upper = max(y_data.max() * 1.2, amplitude_init, 1e-6)
+
         bounds = (
             [0, start_idx - tolerance, time_resolution / 10, 0],
-            [np.inf, end_idx - 1 + tolerance,
+            [amplitude_upper, end_idx - 1 + tolerance,
              (end_idx - start_idx) * time_resolution, np.inf],
         )
 
@@ -537,7 +542,8 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             popt, pcov = result[0], result[1]
         except Exception as e:
             try:
-                result_u = curve_fit(gaussian_pulse, x_data, y_data, p0=p0, maxfev=8000)
+                result_u = curve_fit(gaussian_pulse, x_data, y_data, p0=p0,
+                                     bounds=bounds, maxfev=8000)
                 popt, pcov = result_u[0], result_u[1]
                 A_fit, mu_fit, _, _ = popt
                 if not (start_idx <= mu_fit <= end_idx - 1):
