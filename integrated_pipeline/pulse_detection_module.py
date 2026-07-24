@@ -527,13 +527,13 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         tolerance = max(1, (end_idx - start_idx) * 0.15)
 
         # 振幅上界：拟合峰高 A+background 不应超过原始数据峰值的 1.2 倍
-        # background >= 0 约束下，保守取 A <= y_data.max() * 1.2
         amplitude_upper = max(y_data.max() * 1.2, amplitude_init, 1e-6)
 
+        window_width = end_idx - start_idx  # 样本数
         bounds = (
-            [0, start_idx - tolerance, time_resolution / 10, 0],
+            [0, start_idx - tolerance, 0.1, 0],            # sigma 下界 0.1 样本
             [amplitude_upper, end_idx - 1 + tolerance,
-             (end_idx - start_idx) * time_resolution, np.inf],
+             window_width, np.inf],                          # sigma 上界 ≤ 窗口宽度
         )
 
         try:
