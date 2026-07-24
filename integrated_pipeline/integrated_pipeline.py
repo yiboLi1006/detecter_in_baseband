@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """
-Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.6).
+Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (v7.6.1).
 
+v7.6.1: R² > 0.1 拟合质量筛选 — 在两处脉冲筛选条件中增加 R² 阈值，
+  防止拟合质量极差的噪声涨落通过辐射计方程 SNR 筛选。
 v7.6: 流量 SNR 筛选统一使用 SNR_Flux_Conventional（传统辐射计方程）替代
   SNR_Flux_From_Fit（拟合质量 SNR）。CSV 中 SNR_Flux_Conventional 列重命名为
   SNR_Flux，SNR_Flux_From_Fit 保留为诊断列。图中标注不变（沿用 SNR_Flux）。
@@ -1693,7 +1695,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  detecter_in_baseband  v7.6")
+    print("  detecter_in_baseband  v7.6.1")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
