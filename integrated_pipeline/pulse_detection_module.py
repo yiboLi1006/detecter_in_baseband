@@ -533,7 +533,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             _peak_above_bg = max(_peak_val - background_init, amplitude_init, 1e-6)
         else:
             _peak_above_bg = max(np.nanmax(y_data) - background_init, amplitude_init, 1e-6)
-        amplitude_upper = max(_peak_above_bg * 3.0, 1e-6)
+        amplitude_upper = max(_peak_above_bg * 1.5, 1e-6)
 
         window_width = end_idx - start_idx  # 样本数
         bounds = (
