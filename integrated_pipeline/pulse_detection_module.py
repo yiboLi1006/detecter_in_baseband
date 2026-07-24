@@ -544,6 +544,10 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
              (end_idx - start_idx) * time_resolution, np.inf],
         )
 
+        print(f"[DEBUG v7.7.1] p0={p0}", flush=True)
+        print(f"[DEBUG v7.7.1] bounds_low={bounds[0]}", flush=True)
+        print(f"[DEBUG v7.7.1] bounds_high={bounds[1]}", flush=True)
+
         try:
             result = curve_fit(gaussian_pulse, x_data, y_data, p0=p0, bounds=bounds,
                                maxfev=10000, ftol=1e-8, xtol=1e-8)
