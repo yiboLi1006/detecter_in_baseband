@@ -1445,8 +1445,8 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             if info:
                                 mem_str = f'  mem: {info[2]:.1f}%'
                             print(f"\r### progress: {pct_h:.1f}%  "
-                                  f"{cumulative_pulses} pulses had been detected"
-                                  f"{mem_str}  {elapsed:.1f}min  ",
+                                  f"{cumulative_pulses} pulses detected"
+                                  f"{mem_str}  {elapsed:.1f}min used  ",
                                   end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
@@ -1622,8 +1622,8 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
             if info:
                 mem_str = f'  mem: {info[2]:.1f}%'
             print(f"\r### progress: {pct_m:.1f}%  "
-                  f"{state['pulses']} pulses had been detected"
-                  f"{mem_str}  {elapsed:.1f}min  ",
+                  f"{state['pulses']} pulses detected"
+                  f"{mem_str}  {elapsed:.1f}min used  ",
                   end='', flush=True)
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
