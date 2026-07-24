@@ -542,8 +542,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             popt, pcov = result[0], result[1]
         except Exception as e:
             try:
-                result_u = curve_fit(gaussian_pulse, x_data, y_data, p0=p0,
-                                     bounds=bounds, maxfev=8000)
+                result_u = curve_fit(gaussian_pulse, x_data, y_data, p0=p0, maxfev=8000)
                 popt, pcov = result_u[0], result_u[1]
                 A_fit, mu_fit, _, _ = popt
                 if not (start_idx <= mu_fit <= end_idx - 1):

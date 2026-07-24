@@ -10,7 +10,6 @@ v7.9: 合并 v7.6.1 + v7.7.1 双修复 —
 v7.8: 进度显示重构 — 不显示子进程区间/进度细节，统一用 hdulist 百分比
   实时单行刷新。多进程模式通过 multiprocessing.Manager 共享计数器统计
   全局完成百分比；单进程模式原地计算 hdulist 完成比例。
-
 v7.7: 高斯拟合振幅 A 添加上界约束 — 拟合峰高 (A+background) 不超过
   原始数据峰值 (y_data.max()) 的 1.2 倍，防止窄尖刺（RFI 残余、单 bin
   噪声涨落）被拟合为瘦高假脉冲。fallback 无约束拟合同步加上相同边界。
@@ -1720,11 +1719,7 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
 
 if __name__ == "__main__":
     print("=" * 50)
-<<<<<<< HEAD
-    print("  detecter_in_baseband  v7.8")
-=======
-    print("  detecter_in_baseband  v7.6.1")
->>>>>>> v7.6.1
+    print("  detecter_in_baseband  v7.9")
     print("=" * 50)
     print(f"### Start time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     t0 = time.time()
