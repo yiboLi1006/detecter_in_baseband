@@ -349,7 +349,6 @@ def _plot_single_pulse(original_data, corrected_data, center_idx, half_width,
                  fontsize=14, fontweight='bold', y=0.98)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"  -> pulse plot: {save_path}")
 
 
 def plot_pulses_for_hdulist(raw_fits_path, corrected_fits_path,

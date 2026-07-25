@@ -106,6 +106,4 @@ def save_baseband_segment(input_file, output_file, sample_start, sample_count,
             dst.write(read)
             remaining -= len(read)
 
-    print(f"Saved {data_format.upper()} segment: frames [{start_frame}, {end_frame}), "
-          f"bytes [{byte_start}, {byte_end}) -> {output_file}")
     return output_file
