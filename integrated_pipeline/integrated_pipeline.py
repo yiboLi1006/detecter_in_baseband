@@ -1328,10 +1328,11 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
         tsamp = 1.0 / reduced_sample_rate
         chan_bw = bandwidth / nchans
 
-        print(f"Sample rate: {actual_sample_rate/1e6:.1f} MHz  "
-              f"tsamp: {tsamp:.6f} s  channels: {nchans}  "
-              f"file shape: {file_obj.shape}")
-        _log_rss(tag='startup')
+        if not worker_label:
+            print(f"Sample rate: {actual_sample_rate/1e6:.1f} MHz  "
+                  f"tsamp: {tsamp:.6f} s  channels: {nchans}  "
+                  f"file shape: {file_obj.shape}")
+            _log_rss(tag='startup')
 
         # v7.8: 计时起点，用于进度行显示已运行时间
         t_proc_start = time.time()
