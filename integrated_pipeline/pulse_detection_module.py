@@ -481,6 +481,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
                          time_resolution, method='base', fit_window_factor=3.0,
                          global_noise_sigma=None, amplitude_snrs=None,
                          n_sigma_flux=3.0, n_sigma_fit_quality=3.0,
+                         n_sigma_amplitude=4.0,
                          tbin=None, date_obs_iso=None,
                          offs_sub_arr=None, tsubint_arr=None):
     precise_peaks = []
@@ -582,7 +583,8 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             A_fit, A_err, sigma_fit, sigma_err, global_noise_sigma
         )
         flux_snr_pass = (flux_snr_conventional >= n_sigma_flux
-                         and flux_snr_from_fit >= n_sigma_fit_quality)
+                         and flux_snr_from_fit >= n_sigma_fit_quality
+                         and snr_amp >= n_sigma_amplitude)
 
         absolute_time_obj = None
         jd1 = jd2 = None
@@ -786,12 +788,13 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
         if result is None:
             continue
         snr_amp_det = result.get('snr_amplitude_detection', None)
-        snr_flux_fit = result.get('Fit-quality_SNR', None)
+        snr_amp_fit = result.get('snr_amplitude', 0)
         snr_flux_conv = result.get('flux_snr_conventional', 0)
         snr_fit_quality = result.get('Fit-quality_SNR', 0)
         fit_success = result.get('fit_success', False)
         if not (fit_success and snr_amp_det is not None
                 and snr_amp_det >= n_sigma_amplitude
+                and snr_amp_fit >= n_sigma_amplitude
                 and snr_flux_conv >= n_sigma_flux
                 and snr_fit_quality >= n_sigma_fit_quality):
             continue
@@ -957,6 +960,7 @@ def detect_pulses_in_hdulist(hdulist, params):
         amplitude_snrs=amplitude_snrs_detected,
         n_sigma_flux=n_sigma_flux,
         n_sigma_fit_quality=n_sigma_fit_quality,
+        n_sigma_amplitude=n_sigma_amplitude,
         tbin=obs_info['tbin'],
         date_obs_iso=date_obs_iso,
         offs_sub_arr=offs_sub_arr,

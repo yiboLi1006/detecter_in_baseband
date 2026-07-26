@@ -6,6 +6,9 @@ v7.10.2: 进度行尾部加长空格，防止终端 \r 刷新残留旧字符。
 
 v7.10.1: 静默 VDIF segment 和 pulse plot 保存信息，仅进度行显示脉冲计数。
 
+v7.11: SNR_Amplitude_Fit 纳入筛选 — 候选体须同时通过粗检测和精拟合
+  振幅 SNR（共用 amp_snr_threshold），假脉冲拟合后被压低自然拦截。
+
 v7.10: 三重 SNR 筛选体系 — 删除振幅上界和 R² 检查，回归简洁拟合+
   Fit-quality_SNR(=flux/flux_err) 天然筛选。INI 新增 Fit-quality_SNR 参数。
 
@@ -160,7 +163,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.10.2"
+__version__ = "v7.11"
 
 
 # =========================================================================
