@@ -1365,6 +1365,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
             max(1, int(math.ceil(total_chunks_planned / max_subints_per_file)))
         )
         hdulists_completed = 0
+        _last_printed_pct = -1.0
         cumulative_pulses = 0
 
         subint_data_list = []
@@ -1466,21 +1467,23 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             # 多进程模式：只递增全局计数器，不在此打印
                             shared_hdulist_counter.value += 1
                         else:
-                            # 单进程模式：原地刷新百分比进度行
+                            # 单进程模式：每 0.5% 刷新一次进度行
                             pct_h = 100.0 * hdulists_completed / total_hdulists_planned
-                            elapsed = (time.time() - t_proc_start) / 60.0
-                            mem_str = ''
-                            info = _get_total_rss_percent()
-                            if info:
-                                mem_str = f'  script: {info[0]:.1f}%  sys: {info[1]:.1f}%'
-                            eta_str = _compute_eta(hdulists_completed,
-                                                   total_hdulists_planned,
-                                                   time.time() - t_proc_start)
-                            print(f"\r### progress: {pct_h:.1f}%  "
-                                  f"{cumulative_pulses} pulses detected  "
-                                  f"{mem_str}  {elapsed:.1f}min  "
-                                  f"ETA: {eta_str}      ",
-                                  end='', flush=True)
+                            if pct_h - _last_printed_pct >= 0.5:
+                                _last_printed_pct = pct_h
+                                elapsed = (time.time() - t_proc_start) / 60.0
+                                mem_str = ''
+                                info = _get_total_rss_percent()
+                                if info:
+                                    mem_str = f'  script: {info[0]:.1f}%  sys: {info[1]:.1f}%'
+                                eta_str = _compute_eta(hdulists_completed,
+                                                       total_hdulists_planned,
+                                                       time.time() - t_proc_start)
+                                print(f"\r### progress: {pct_h:.1f}%  "
+                                      f"{cumulative_pulses} pulses detected  "
+                                      f"{mem_str}  {elapsed:.1f}min  "
+                                      f"ETA: {eta_str}      ",
+                                      end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
                         gc.collect()
