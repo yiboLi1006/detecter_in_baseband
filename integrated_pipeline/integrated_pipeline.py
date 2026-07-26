@@ -1476,11 +1476,12 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             eta_str = _compute_eta(hdulists_completed,
                                                    total_hdulists_planned,
                                                    time.time() - t_proc_start)
-                            print(f"\033[K\r### progress: {pct_h:.1f}%  "
-                                  f"{cumulative_pulses} pulses detected  "
-                                  f"{mem_str}  {elapsed:.1f}min  "
-                                  f"ETA: {eta_str}      ",
-                                  end='', flush=True)
+                            line = (f"\r### progress: {pct_h:.1f}%  "
+                                    f"{cumulative_pulses} pulses  "
+                                    f"{mem_str}  {elapsed:.1f}min  "
+                                    f"ETA: {eta_str}")
+                            sys.stdout.write(f"{line:<130}\r")
+                            sys.stdout.flush()
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
                         gc.collect()
@@ -1654,11 +1655,12 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
             if info:
                 mem_str = f'  script: {info[0]:.1f}%  sys: {info[1]:.1f}%'
             eta_str = _compute_eta(done, m, time.time() - t_proc_start)
-            print(f"\033[K\r### progress: {pct_m:.1f}%  "
-                  f"{state['pulses']} pulses detected  "
-                  f"{mem_str}  {elapsed:.1f}min  "
-                  f"ETA: {eta_str}      ",
-                  end='', flush=True)
+            line = (f"\r### progress: {pct_m:.1f}%  "
+                    f"{state['pulses']} pulses  "
+                    f"{mem_str}  {elapsed:.1f}min  "
+                    f"ETA: {eta_str}")
+            sys.stdout.write(f"{line:<130}\r")
+            sys.stdout.flush()
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
     mon_t.start()
