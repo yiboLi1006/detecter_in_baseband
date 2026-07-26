@@ -1472,7 +1472,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             mem_str = ''
                             info = _get_total_rss_percent()
                             if info:
-                                mem_str = f' | script: {info[0]:.1f}% | sys: {info[1]:.1f}%'
+                                mem_str = f' | program: {info[0]:.1f}% | sys: {info[1]:.1f}%'
                             eta_str = _compute_eta(hdulists_completed,
                                                    total_hdulists_planned,
                                                    time.time() - t_proc_start)
@@ -1651,10 +1651,10 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
             info = _get_total_rss_percent()
             mem_str = ''
             if info:
-                mem_str = f' | script: {info[0]:.1f}% | sys: {info[1]:.1f}%'
+                mem_str = f' | program: {info[0]:.1f}% | sys: {info[1]:.1f}%'
             eta_str = _compute_eta(done, m, time.time() - t_proc_start)
-            line = (f"  {pct_m:.1f}%  |  {state['pulses']} pulses  "
-                    f"{mem_str}  |  {elapsed:.1f}min  |  ETA: {eta_str}")
+            line = (f"  {pct_m:.1f}%  processed  |  {state['pulses']} pulses  detected  "
+                    f"{mem_str}  |  {elapsed:.1f}min  used  |  ETA: {eta_str}")
             sys.stdout.write(f"\033[2K\r{line:<105}\r")
             sys.stdout.flush()
 
