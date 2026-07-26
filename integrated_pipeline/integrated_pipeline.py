@@ -2,6 +2,8 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v7.10.2: 进度行尾部加长空格，防止终端 \r 刷新残留旧字符。
+
 v7.10.1: 静默 VDIF segment 和 pulse plot 保存信息，仅进度行显示脉冲计数。
 
 v7.10: 三重 SNR 筛选体系 — 删除振幅上界和 R² 检查，回归简洁拟合+
@@ -158,7 +160,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.10.1"
+__version__ = "v7.10.2"
 
 
 # =========================================================================
@@ -1458,7 +1460,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                                 mem_str = f'  mem: {info[2]:.1f}%'
                             print(f"\r### progress: {pct_h:.1f}%  "
                                   f"{cumulative_pulses} pulses detected"
-                                  f"{mem_str}  {elapsed:.1f}min used  ",
+                                  f"{mem_str}  {elapsed:.1f}min used      ",
                                   end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
@@ -1635,7 +1637,7 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
                 mem_str = f'  mem: {info[2]:.1f}%'
             print(f"\r### progress: {pct_m:.1f}%  "
                   f"{state['pulses']} pulses detected"
-                  f"{mem_str}  {elapsed:.1f}min used  ",
+                  f"{mem_str}  {elapsed:.1f}min used      ",
                   end='', flush=True)
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
