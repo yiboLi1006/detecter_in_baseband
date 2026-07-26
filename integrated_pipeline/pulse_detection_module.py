@@ -44,12 +44,15 @@ Adapted from former_script/Pulse_detection_v4.1_ur.py.
 """
 
 import math
+import warnings
 import numpy as np
 from astropy.time import Time
 import astropy.units as u
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
 from decimal import Decimal, getcontext
+
+warnings.filterwarnings('ignore', 'Mean of empty slice')
 
 
 # ---------------------------------------------------------------------------

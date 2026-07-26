@@ -1611,8 +1611,7 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
     m = max(1, math.ceil(total_chunks / max_subints))           # 全局 hdulist 数
     n_workers = min(n_processes, m)                             # n>m 时多余不启动
     bounds = [(i * m // n_workers, (i + 1) * m // n_workers) for i in range(n_workers)]
-    print(f"### v7.8 multiprocess: m={m} hdulists, n_processes={n_processes}, "
-          f"n_workers={n_workers}")
+    print(f"Processing {m} hdulists with {n_workers} workers")
 
     # v7.8: Manager 共享计数器，worker 每完成一个 hdulist 递增
     _manager = Manager()
@@ -1780,7 +1779,6 @@ if __name__ == "__main__":
     n_processes = params.get('n_processes', 1)
     if n_processes and n_processes > 1:
         # ---------- v7 多进程路径 ----------
-        print(f"### v7 multiprocess mode: n_processes={n_processes}")
         run_multiprocess(params, detection_params, dm_ref_freq, n_processes)
     else:
         # ---------- 单进程路径（v6.1 完全兼容）----------
