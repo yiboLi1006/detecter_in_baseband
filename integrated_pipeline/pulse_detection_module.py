@@ -858,7 +858,7 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
             'SNR_Amplitude_Detection': float(snr_amp_det) if snr_amp_det is not None else np.nan,
             'Flux_From_Fit': float(flux_val) if flux_val is not None else np.nan,
             'Flux_Err': float(flux_err_val) if flux_err_val is not None else np.nan,
-            'Fit-quality_SNR': float(snr_flux_fit) if snr_flux_fit is not None else np.nan,
+            'Fit-quality_SNR': float(snr_fit_quality),
             'SNR_Flux': float(snr_flux_conv),
         })
         pulse_data_list.append(pulse_data)
