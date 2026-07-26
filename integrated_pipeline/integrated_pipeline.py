@@ -216,7 +216,7 @@ def _log_rss(tag=''):
 
 
 def _get_total_rss_percent():
-    """v7: 返回 (total_rss_gib, sys_total_gib, pct)；psutil 不可用返回 None。"""
+    """v7.11: 返回 (script_pct, sys_used_pct)；psutil 不可用返回 None。"""
     if not _HAS_PSUTIL:
         return None
     try:
@@ -227,19 +227,31 @@ def _get_total_rss_percent():
                 total_rss += child.memory_info().rss
             except Exception:
                 pass
-        sys_total = _psutil.virtual_memory().total
-        return total_rss / (1 << 30), sys_total / (1 << 30), total_rss / sys_total * 100
+        vmem = _psutil.virtual_memory()
+        script_pct = total_rss / vmem.total * 100
+        sys_used_pct = vmem.percent
+        return script_pct, sys_used_pct
     except Exception:
         return None
 
 
+def _compute_eta(done, total, elapsed_sec):
+    """v7.11: 根据已处理 hdulist 数和用时估算预计结束时间。
+    前 5 个 hdulist 或不足 1% 时返回 '--:--'。"""
+    if done < 5 or total <= 0 or elapsed_sec <= 0:
+        return "--:--"
+    rate = done / elapsed_sec
+    remaining = (total - done) / rate
+    finish = time.time() + remaining
+    return time.strftime("%H:%M", time.localtime(finish))
+
+
 def _log_total_rss_percent():
-    """v7: 打印主进程+所有子进程的总 RSS 及占系统内存百分比（psutil 不可用则静默）。"""
+    """v7.11: 打印脚本总 RSS 及系统内存占比（psutil 不可用则静默）。"""
     info = _get_total_rss_percent()
     if info:
-        rss_gib, sys_gib, pct = info
-        print(f"### [memory] total RSS = {rss_gib:.2f} GiB / "
-              f"{sys_gib:.1f} GiB ({pct:.1f}%)")
+        script_pct, sys_pct = info
+        print(f"### [memory] script={script_pct:.1f}%  sys={sys_pct:.1f}%")
 
 
 def _parse_sample_rate(sample_rate_str):
@@ -1332,7 +1344,6 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
             print(f"Sample rate: {actual_sample_rate/1e6:.1f} MHz  "
                   f"tsamp: {tsamp:.6f} s  channels: {nchans}  "
                   f"file shape: {file_obj.shape}")
-            _log_rss(tag='startup')
 
         # v7.8: 计时起点，用于进度行显示已运行时间
         t_proc_start = time.time()
@@ -1461,10 +1472,14 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             mem_str = ''
                             info = _get_total_rss_percent()
                             if info:
-                                mem_str = f'  mem: {info[2]:.1f}%'
+                                mem_str = f'  script: {info[0]:.1f}%  sys: {info[1]:.1f}%'
+                            eta_str = _compute_eta(hdulists_completed,
+                                                   total_hdulists_planned,
+                                                   time.time() - t_proc_start)
                             print(f"\r### progress: {pct_h:.1f}%  "
-                                  f"{cumulative_pulses} pulses detected"
-                                  f"{mem_str}  {elapsed:.1f}min used      ",
+                                  f"{cumulative_pulses} pulses detected  "
+                                  f"{mem_str}  {elapsed:.1f}min  "
+                                  f"ETA: {eta_str}      ",
                                   end='', flush=True)
 
                         # per-hdulist memory cleanup (gc + malloc_trim)
@@ -1637,10 +1652,12 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
             info = _get_total_rss_percent()
             mem_str = ''
             if info:
-                mem_str = f'  mem: {info[2]:.1f}%'
+                mem_str = f'  script: {info[0]:.1f}%  sys: {info[1]:.1f}%'
+            eta_str = _compute_eta(done, m, time.time() - t_proc_start)
             print(f"\r### progress: {pct_m:.1f}%  "
-                  f"{state['pulses']} pulses detected"
-                  f"{mem_str}  {elapsed:.1f}min used      ",
+                  f"{state['pulses']} pulses detected  "
+                  f"{mem_str}  {elapsed:.1f}min  "
+                  f"ETA: {eta_str}      ",
                   end='', flush=True)
 
     mon_t = threading.Thread(target=_monitor, daemon=True)
