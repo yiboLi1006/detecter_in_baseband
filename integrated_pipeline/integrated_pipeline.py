@@ -243,7 +243,7 @@ def _compute_eta(done, total, elapsed_sec):
     rate = done / elapsed_sec
     remaining = (total - done) / rate
     finish = time.time() + remaining
-    return time.strftime("%H:%M", time.localtime(finish))
+    return time.strftime("%m-%d %H:%M", time.localtime(finish))
 
 
 def _log_total_rss_percent():
