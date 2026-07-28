@@ -6,6 +6,8 @@ v7.10.2: 进度行尾部加长空格，防止终端 \r 刷新残留旧字符。
 
 v7.10.1: 静默 VDIF segment 和 pulse plot 保存信息，仅进度行显示脉冲计数。
 
+v7.12: 高斯拟合窗口最小宽度 301 → 101 采样点。
+
 v7.11: SNR_Amplitude_Fit 纳入筛选 — 候选体须同时通过粗检测和精拟合
   振幅 SNR（共用 amp_snr_threshold），假脉冲拟合后被压低自然拦截。
 
@@ -163,7 +165,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.11"
+__version__ = "v7.12"
 
 
 # =========================================================================

@@ -494,7 +494,7 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
     for i, (peak_idx, pulse_width_ms) in enumerate(zip(peaks_index, pulse_widths_ms)):
         window_size_samples = int((pulse_width_ms * fit_window_factor) /
                                   (time_resolution * 1000))
-        window_size_samples = max(window_size_samples, 301)
+        window_size_samples = max(window_size_samples, 101)
         if window_size_samples % 2 == 0:
             window_size_samples += 1
 
