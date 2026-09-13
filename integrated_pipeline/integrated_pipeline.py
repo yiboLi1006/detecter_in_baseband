@@ -2,6 +2,12 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v8.1: 目录模式支持 — vdif_file 可指向目录：
+  - data_format=vdif 时：自动处理目录下所有 .vdif / .m5a 文件（按文件名排序）
+  - data_format=mark5b 时：自动处理目录下所有 Mark5B scan 片段（按数字排序）
+  新增 scan_pattern 参数（Mark5B 专用，默认 'scan*.source.*'）。
+  baseband 多文件拼接，下游处理逻辑无变化。
+
 v7.13: max_files 参数支持 False（处理全部数据）；CSV 输出新增参考频率 TOA
   与无穷大频率 TOA 两列；USED time 打印单位改为 min。
 
@@ -168,7 +174,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.13"
+__version__ = "v8.1"
 
 
 # =========================================================================
@@ -1226,12 +1232,99 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
 
 
 # =========================================================================
-# Data-file opening + start-sample math  (verbatim from v16)
+# Data-file opening + start-sample math  (v8.1: 新增目录模式)
 # =========================================================================
+
+def discover_vdif_files(directory):
+    """
+    扫描目录，返回按文件名排序的 VDIF 文件列表。
+
+    Parameters:
+    -----------
+    directory : str
+        VDIF 文件所在目录
+
+    Returns:
+    --------
+    list of str
+        排序后的文件路径列表（.vdif 和 .m5a 后缀）
+    """
+    import glob
+
+    # 匹配 .vdif 和 .m5a 后缀
+    vdif_files = glob.glob(os.path.join(directory, '*.vdif'))
+    m5a_files = glob.glob(os.path.join(directory, '*.m5a'))
+
+    all_files = vdif_files + m5a_files
+
+    if not all_files:
+        raise FileNotFoundError(
+            f"目录 {directory} 中未找到 VDIF 文件（.vdif 或 .m5a）"
+        )
+
+    # 按文件名字母顺序排序
+    files_sorted = sorted(all_files)
+
+    return files_sorted
+
+
+def discover_mark5b_scans(directory, pattern='scan*.source.*'):
+    """
+    扫描目录，返回按数字排序的 Mark5B scan 文件列表。
+
+    Parameters:
+    -----------
+    directory : str
+        Mark5B scan 文件所在目录
+    pattern : str
+        glob 匹配模式（默认 'scan*.source.*'）
+
+    Returns:
+    --------
+    list of str
+        排序后的文件路径列表
+    """
+    import glob
+    import re
+
+    scan_files = glob.glob(os.path.join(directory, pattern))
+
+    if not scan_files:
+        raise FileNotFoundError(
+            f"目录 {directory} 中未找到匹配 '{pattern}' 的 Mark5B scan 文件"
+        )
+
+    # 按文件名中的数字排序
+    def extract_scan_number(filepath):
+        basename = os.path.basename(filepath)
+        match = re.search(r'scan(\d+)', basename)
+        return int(match.group(1)) if match else 0
+
+    files_sorted = sorted(scan_files, key=extract_scan_number)
+
+    return files_sorted
+
 
 def open_data_file(data_file, data_format, withsubband, subset,
                    sample_rate_value, ref_time_str=None, nchan=1,
-                   verify_frame=True):
+                   verify_frame=True, scan_pattern='scan*.source.*'):
+    """
+    打开数据文件，支持 VDIF / Mark5B（单文件或目录）。
+
+    Parameters:
+    -----------
+    data_file : str
+        文件路径或目录路径：
+        - VDIF 单文件：.vdif 或 .m5a 文件
+        - VDIF 目录：包含多个 VDIF 文件的目录（v8.1 新增）
+        - Mark5B 单文件：单个 Mark5B 文件
+        - Mark5B 目录：包含多个 Mark5B scan 片段的目录（v8.1 新增）
+    data_format : str
+        'vdif' 或 'mark5b'
+    scan_pattern : str
+        Mark5B 目录模式下用于匹配 scan 文件的 glob 模式（默认 'scan*.source.*'）
+    """
+
     if data_format == 'mark5b':
         ref_time = None
         if ref_time_str and ref_time_str.strip():
@@ -1243,21 +1336,66 @@ def open_data_file(data_file, data_format, withsubband, subset,
         else:
             print("Mark5B format requires a reference time (ref_time parameter)")
             return None
+
+        # 判断：单文件 vs 目录
+        if os.path.isfile(data_file):
+            # 原有逻辑：单个 Mark5B 文件
+            print(f"打开 Mark5B 文件: {data_file}")
+            input_files = data_file
+
+        elif os.path.isdir(data_file):
+            # 🆕 目录模式：处理目录下所有 Mark5B scan 片段
+            print(f"扫描 Mark5B scan 目录: {data_file}")
+            scan_files = discover_mark5b_scans(data_file, scan_pattern)
+            print(
+                f"发现 {len(scan_files)} 个 Mark5B scan 文件 "
+                f"({os.path.basename(scan_files[0])} ... "
+                f"{os.path.basename(scan_files[-1])})"
+            )
+            input_files = scan_files
+
+        else:
+            raise FileNotFoundError(f"路径不存在: {data_file}")
+
+        # 统一打开（单文件或多文件）
         if withsubband:
             return baseband.open(
-                data_file, mode='rs', format='mark5b', nchan=nchan,
+                input_files, mode='rs', format='mark5b', nchan=nchan,
                 sample_rate=sample_rate_value * u.Hz, subset=subset,
                 ref_time=ref_time, verify=verify_frame)
         return baseband.open(
-            data_file, mode='rs', format='mark5b', nchan=nchan,
+            input_files, mode='rs', format='mark5b', nchan=nchan,
             sample_rate=sample_rate_value * u.Hz, ref_time=ref_time,
             verify=verify_frame)
+
+    # data_format == 'vdif'
+    # 判断：单文件 vs 目录
+    if os.path.isfile(data_file):
+        # 原有逻辑：单个 VDIF 文件
+        print(f"打开 VDIF 文件: {data_file}")
+        input_files = data_file
+
+    elif os.path.isdir(data_file):
+        # 🆕 目录模式：处理目录下所有 VDIF 文件
+        print(f"扫描 VDIF 目录: {data_file}")
+        vdif_files = discover_vdif_files(data_file)
+        print(
+            f"发现 {len(vdif_files)} 个 VDIF 文件 "
+            f"({os.path.basename(vdif_files[0])} ... "
+            f"{os.path.basename(vdif_files[-1])})"
+        )
+        input_files = vdif_files
+
+    else:
+        raise FileNotFoundError(f"路径不存在: {data_file}")
+
+    # 统一打开（单文件或多文件）
     if withsubband:
         return baseband.open(
-            data_file, mode='rs', format='vdif', subset=subset,
+            input_files, mode='rs', format='vdif', subset=subset,
             verify=verify_frame, sample_rate=sample_rate_value * u.Hz)
     return baseband.open(
-        data_file, mode='rs', format='vdif',
+        input_files, mode='rs', format='vdif',
         verify=verify_frame, sample_rate=sample_rate_value * u.Hz)
 
 
