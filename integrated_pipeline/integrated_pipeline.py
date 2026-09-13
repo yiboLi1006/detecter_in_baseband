@@ -2,6 +2,9 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v7.13: max_files 参数支持 False（处理全部数据）；CSV 输出新增参考频率 TOA
+  与无穷大频率 TOA 两列；USED time 打印单位改为 min。
+
 v7.10.2: 进度行尾部加长空格，防止终端 \r 刷新残留旧字符。
 
 v7.10.1: 静默 VDIF segment 和 pulse plot 保存信息，仅进度行显示脉冲计数。
@@ -165,7 +168,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.12"
+__version__ = "v7.13"
 
 
 # =========================================================================
@@ -365,7 +368,16 @@ def read_config(config_file):
 
     # -- output --
     params['max_subints_per_file'] = config.getint('output', 'max_subints_per_file', fallback=2)
-    params['max_files'] = config.getint('output', 'max_files', fallback=1)
+    max_files_raw = config.get('output', 'max_files', fallback='1')
+    # v7.13: max_files 支持 False 表示处理所有数据
+    if max_files_raw.strip().lower() in ('false', 'none', ''):
+        params['max_files'] = float('inf')  # 无穷大表示全部处理
+    else:
+        try:
+            params['max_files'] = int(max_files_raw)
+        except ValueError:
+            print(f"Warning: Invalid max_files value '{max_files_raw}', defaulting to 1")
+            params['max_files'] = 1
     params['version'] = config.getint('output', 'version', fallback=4)
 
     # -- frequency --
@@ -1724,7 +1736,11 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
     if 'Precise_Abs_MJD_Str' in df.columns:
         df['Precise_Abs_MJD_Str'] = df['Precise_Abs_MJD_Str'].astype(str)
 
-    for extra in ['Precise_JD1', 'Precise_JD2', 'Precise_Abs_MJD_Str']:
+    # v7.13: 添加 TOA 相关列
+    for extra in ['Precise_JD1', 'Precise_JD2', 'Precise_Abs_MJD_Str',
+                  'TOA_Ref_Freq_MJD', 'TOA_Ref_Freq_UTC',
+                  'Precise_JD1_Inf', 'Precise_JD2_Inf', 'Precise_Abs_MJD_Str_Inf',
+                  'TOA_Inf_Freq_MJD', 'TOA_Inf_Freq_UTC']:
         if extra in df.columns and extra not in column_order:
             column_order.append(extra)
 
@@ -1782,12 +1798,17 @@ if __name__ == "__main__":
         'sigma_remove_rfi_frequency': params['sigma_remove_rfi_frequency'],
         'sigma_remove_rfi_time_frequency': params['sigma_remove_rfi_time_frequency'],
         'manual_mask_freq_ranges': params['detection_freq_mask_ranges'],
+        'dm': params['dm_source'],
+        'center_freq': params['center_freq'],
     }
 
     dm_ref_freq = params['dm_ref_freq']
     if dm_ref_freq is None:
         dm_ref_freq = params['center_freq']
         print(f"DM ref_freq blank in ini; defaulting to center_freq = {dm_ref_freq} MHz")
+
+    # v7.13: 将 ref_freq 也添加到 detection_params
+    detection_params['ref_freq'] = dm_ref_freq
 
     if not check_parameters(params['chunk_size'], params['reduction_factor'],
                             params['nchans']):
@@ -1841,6 +1862,7 @@ if __name__ == "__main__":
         )
 
     t1 = time.time()
-    print(f"### USED time: {t1 - t0:.3f} sec")
+    elapsed_min = (t1 - t0) / 60.0
+    print(f"### USED time: {elapsed_min:.2f} min")
     print(f"### Stop time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     print("#" * 60)

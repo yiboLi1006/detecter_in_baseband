@@ -409,13 +409,44 @@ def calculate_flux_snr_from_fit(A_fit, A_err, sigma_fit, sigma_err, noise_sigma)
 # v4.0 TOA helpers (verbatim)
 # ---------------------------------------------------------------------------
 
-def calculate_pulse_absolute_time(mu_fit, tbin, date_obs_iso, offs_sub=0.0, tsubint=0.0):
+def calculate_pulse_absolute_time(mu_fit, tbin, date_obs_iso, offs_sub=0.0, tsubint=0.0,
+                                  dm=None, ref_freq=None, obs_freq=None):
     """v5: compute absolute TOA following PSRFITS convention.
 
     TOA = DATE-OBS + (OFFS_SUB - TSUBINT/2) + mu_fit * TBIN
 
     where (OFFS_SUB - TSUBINT/2) gives the subint start time and
     mu_fit * TBIN locates the pulse within the subint.
+
+    v7.13: 新增 dm, ref_freq, obs_freq 参数，同时返回参考频率 TOA 和无穷大频率 TOA。
+
+    Parameters
+    ----------
+    dm : float, optional
+        色散量 (pc/cm^3)，用于计算无穷大频率 TOA
+    ref_freq : float, optional
+        参考频率 (MHz)，用于计算色散延迟
+    obs_freq : float, optional
+        观测频率 (MHz)，用于计算色散延迟
+
+    Returns
+    -------
+    relative_time_sec : float
+        相对时间（秒）
+    relative_time_ms : float
+        相对时间（毫秒）
+    absolute_time : astropy.time.Time
+        参考频率下的绝对时间对象
+    jd1, jd2 : float
+        参考频率下的 JD 分量
+    absolute_utc : str
+        参考频率下的 UTC 字符串
+    absolute_time_inf : astropy.time.Time or None
+        无穷大频率下的绝对时间对象
+    jd1_inf, jd2_inf : float or None
+        无穷大频率下的 JD 分量
+    absolute_utc_inf : str or None
+        无穷大频率下的 UTC 字符串
     """
     relative_time_sec = mu_fit * tbin
     relative_time_ms = relative_time_sec * 1000.0
@@ -429,7 +460,29 @@ def calculate_pulse_absolute_time(mu_fit, tbin, date_obs_iso, offs_sub=0.0, tsub
     absolute_utc = absolute_time.isot
     jd1 = absolute_time.jd1
     jd2 = absolute_time.jd2
-    return relative_time_sec, relative_time_ms, absolute_time, jd1, jd2, absolute_utc
+
+    # v7.13: 计算无穷大频率 TOA（扣除色散延迟）
+    absolute_time_inf = None
+    jd1_inf = None
+    jd2_inf = None
+    absolute_utc_inf = None
+
+    if dm is not None and ref_freq is not None and obs_freq is not None and dm > 0:
+        # 色散延迟公式：Δt = 4.149e3 * DM * (1/f_obs^2 - 1/f_ref^2) ms
+        # 参考频率下已消色散，扣除观测频率相对参考频率的色散延迟即得无穷大频率 TOA
+        disp_delay_ms = 4.149e3 * dm * (1.0 / (obs_freq**2) - 1.0 / (ref_freq**2))
+        disp_delay_sec = disp_delay_ms / 1000.0
+        absolute_time_inf = absolute_time - disp_delay_sec * u.s
+        try:
+            absolute_time_inf.precision = 9
+        except Exception:
+            pass
+        absolute_utc_inf = absolute_time_inf.isot
+        jd1_inf = absolute_time_inf.jd1
+        jd2_inf = absolute_time_inf.jd2
+
+    return (relative_time_sec, relative_time_ms, absolute_time, jd1, jd2, absolute_utc,
+            absolute_time_inf, jd1_inf, jd2_inf, absolute_utc_inf)
 
 
 def _compose_mjd_string_from_jd_parts(jd1, jd2, digits=15):
@@ -486,7 +539,8 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
                          n_sigma_flux=3.0, n_sigma_fit_quality=3.0,
                          n_sigma_amplitude=4.0,
                          tbin=None, date_obs_iso=None,
-                         offs_sub_arr=None, tsubint_arr=None):
+                         offs_sub_arr=None, tsubint_arr=None,
+                         dm=None, ref_freq=None, obs_freq=None):
     precise_peaks = []
     precise_times = []
     fit_results = []
@@ -592,6 +646,9 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
         absolute_time_obj = None
         jd1 = jd2 = None
         precise_mjd_str = None
+        absolute_time_obj_inf = None
+        jd1_inf = jd2_inf = None
+        precise_mjd_str_inf = None
         if tbin is not None and date_obs_iso is not None:
             # v5: use OFFS_SUB[0] as baseline + mu_fit * tbin for absolute time
             _offs_sub = 0.0
@@ -600,15 +657,25 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
                 _offs_sub = float(offs_sub_arr[0])
                 _tsubint = float(tsubint_arr[0])
             (relative_time_sec, relative_time_ms, absolute_time_obj,
-             jd1, jd2, absolute_utc) = calculate_pulse_absolute_time(
-                mu_fit, tbin, date_obs_iso, offs_sub=_offs_sub, tsubint=_tsubint)
+             jd1, jd2, absolute_utc,
+             absolute_time_obj_inf, jd1_inf, jd2_inf, absolute_utc_inf) = calculate_pulse_absolute_time(
+                mu_fit, tbin, date_obs_iso, offs_sub=_offs_sub, tsubint=_tsubint,
+                dm=dm, ref_freq=ref_freq, obs_freq=obs_freq)
             absolute_mjd = absolute_time_obj.mjd
             precise_mjd_str = _compose_mjd_string_from_jd_parts(jd1, jd2, digits=15)
+            if absolute_time_obj_inf is not None:
+                absolute_mjd_inf = absolute_time_obj_inf.mjd
+                precise_mjd_str_inf = _compose_mjd_string_from_jd_parts(jd1_inf, jd2_inf, digits=15)
+            else:
+                absolute_mjd_inf = None
+                absolute_utc_inf = None
         else:
             relative_time_sec = times[start_idx] + (mu_fit - start_idx) * time_resolution
             relative_time_ms = relative_time_sec * 1000
             absolute_mjd = None
             absolute_utc = None
+            absolute_mjd_inf = None
+            absolute_utc_inf = None
 
         fit_result = {
             'pulse_index': i, 'coarse_peak_idx': peak_idx,
@@ -620,6 +687,11 @@ def precise_pulse_timing(lightcurve, times, peaks_index, pulse_widths_ms, width_
             'precise_time_timeobj': absolute_time_obj,
             'precise_time_jd1': jd1, 'precise_time_jd2': jd2,
             'precise_time_mjd_str': precise_mjd_str,
+            'precise_time_mjd_inf': absolute_mjd_inf,
+            'precise_time_utc_inf': absolute_utc_inf,
+            'precise_time_timeobj_inf': absolute_time_obj_inf,
+            'precise_time_jd1_inf': jd1_inf, 'precise_time_jd2_inf': jd2_inf,
+            'precise_time_mjd_str_inf': precise_mjd_str_inf,
             'amplitude': A_fit, 'amplitude_err': A_err,
             'sigma': sigma_fit, 'sigma_err': sigma_err,
             'fwhm_sec': fwhm_fit, 'fwhm_ms': fwhm_fit * 1000,
@@ -774,7 +846,8 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                                 coarse_relative_times_rounded, coarse_absolute_mjd,
                                 coarse_utc_times,
                                 n_sigma_amplitude, n_sigma_flux,
-                                n_sigma_fit_quality):
+                                n_sigma_fit_quality,
+                                dm=None, ref_freq=None, obs_freq=None):
     pulse_data_list = []
     if len(peaks_detected) == 0:
         return pulse_data_list
@@ -815,6 +888,16 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
         if precise_utc is None:
             precise_utc = mjd_to_utc_string(precise_abs_mjd, subsecond_digits=9)
 
+        # v7.13: 无穷大频率 TOA
+        precise_abs_mjd_inf = result.get('precise_time_mjd_inf')
+        precise_utc_inf = result.get('precise_time_utc_inf')
+        if precise_abs_mjd_inf is None and dm is not None and ref_freq is not None and obs_freq is not None:
+            # 备用计算：从参考频率 TOA 扣除色散延迟
+            disp_delay_ms = 4.149e3 * dm * (1.0 / (obs_freq**2) - 1.0 / (ref_freq**2))
+            precise_abs_mjd_inf_calc = Time(precise_abs_mjd, format='mjd', scale='utc') - disp_delay_ms * u.ms
+            precise_abs_mjd_inf = precise_abs_mjd_inf_calc.mjd
+            precise_utc_inf = mjd_to_utc_string(precise_abs_mjd_inf, subsecond_digits=9)
+
         pulse_data = {
             'Coarse_Index': int(peak_idx),
             'Precise_Rel_Time_ms': float(precise_rel_time_ms),
@@ -824,6 +907,9 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
 
         jd1_val = result.get('precise_time_jd1')
         jd2_val = result.get('precise_time_jd2')
+        jd1_val_inf = result.get('precise_time_jd1_inf')
+        jd2_val_inf = result.get('precise_time_jd2_inf')
+
         if jd1_val is not None and jd2_val is not None:
             precise_mjd_string = (result.get('precise_time_mjd_str')
                                   or _compose_mjd_string_from_jd_parts(jd1_val, jd2_val,
@@ -832,6 +918,27 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                 'Precise_JD1': float(jd1_val),
                 'Precise_JD2': float(jd2_val),
                 'Precise_Abs_MJD_Str': precise_mjd_string,
+                'TOA_Ref_Freq_MJD': float(precise_abs_mjd) if precise_abs_mjd is not None else np.nan,
+                'TOA_Ref_Freq_UTC': str(precise_utc) if precise_utc is not None else '',
+            })
+
+        # v7.13: 无穷大频率 TOA 列
+        if jd1_val_inf is not None and jd2_val_inf is not None:
+            precise_mjd_string_inf = (result.get('precise_time_mjd_str_inf')
+                                      or _compose_mjd_string_from_jd_parts(jd1_val_inf, jd2_val_inf,
+                                                                           digits=coarse_mjd_digits))
+            pulse_data.update({
+                'Precise_JD1_Inf': float(jd1_val_inf),
+                'Precise_JD2_Inf': float(jd2_val_inf),
+                'Precise_Abs_MJD_Str_Inf': precise_mjd_string_inf,
+                'TOA_Inf_Freq_MJD': float(precise_abs_mjd_inf) if precise_abs_mjd_inf is not None else np.nan,
+                'TOA_Inf_Freq_UTC': str(precise_utc_inf) if precise_utc_inf is not None else '',
+            })
+        elif precise_abs_mjd_inf is not None:
+            # 仅有备用计算结果
+            pulse_data.update({
+                'TOA_Inf_Freq_MJD': float(precise_abs_mjd_inf),
+                'TOA_Inf_Freq_UTC': str(precise_utc_inf) if precise_utc_inf is not None else '',
             })
 
         time_error_ms = 0.001
@@ -881,6 +988,8 @@ def detect_pulses_in_hdulist(hdulist, params):
     stages so that, at any moment, only one full-size data buffer is
     resident instead of (data_2d + data_freq_cleaned + data_tf_cleaned).
 
+    v7.13: 新增 dm, ref_freq, center_freq 参数用于计算无穷大频率 TOA。
+
     Returns
     -------
     list[dict]
@@ -895,6 +1004,11 @@ def detect_pulses_in_hdulist(hdulist, params):
     manual_mask_ranges = params.get('manual_mask_freq_ranges') or []
     min_prom_factor = params.get('min_prominence_sigma_factor', 0.3)
     tf_window = params.get('rfi_time_freq_window', 200)
+
+    # v7.13: 色散和频率参数
+    dm = params.get('dm', None)
+    ref_freq = params.get('ref_freq', None)
+    center_freq = params.get('center_freq', None)
 
     # ----- Step 1: Read data from hdulist -----
     data_2d, freqs, times, header_info = _read_psrfits_data_from_hdulist(
@@ -968,6 +1082,9 @@ def detect_pulses_in_hdulist(hdulist, params):
         date_obs_iso=date_obs_iso,
         offs_sub_arr=offs_sub_arr,
         tsubint_arr=tsubint_arr,
+        dm=dm,
+        ref_freq=ref_freq,
+        obs_freq=center_freq,
     )
     if len(fit_results) == 0:
         del lightcurve, final_times, times, freqs, _precise_peaks, _precise_times
@@ -993,6 +1110,9 @@ def detect_pulses_in_hdulist(hdulist, params):
         n_sigma_amplitude=n_sigma_amplitude,
         n_sigma_flux=n_sigma_flux,
         n_sigma_fit_quality=n_sigma_fit_quality,
+        dm=dm,
+        ref_freq=ref_freq,
+        obs_freq=center_freq,
     )
     # v7.8: 脉冲计数改为 integrated_pipeline 进度行实时刷新
 
