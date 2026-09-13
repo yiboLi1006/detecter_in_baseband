@@ -2,6 +2,9 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v8.1.1: Mark5B 多文件排序修复 — 支持 scan1.source1, scan1.source2... 格式：
+  按 (scan编号, source编号) 元组排序，保证同一 scan 下多个 source 文件的正确顺序。
+
 v8.1: 目录模式支持 — vdif_file 可指向目录：
   - data_format=vdif 时：自动处理目录下所有 .vdif / .m5a 文件（按文件名排序）
   - data_format=mark5b 时：自动处理目录下所有 Mark5B scan 片段（按数字排序）
@@ -174,7 +177,7 @@ from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v8.1"
+__version__ = "v8.1.1"
 
 
 # =========================================================================
@@ -361,6 +364,8 @@ def read_config(config_file):
                                      fallback='./ywwu_data/p51015_km_no0009.vdif')
     params['data_format'] = config.get('paths', 'data_format',
                                        fallback='vdif').lower()
+    params['scan_pattern'] = config.get('paths', 'scan_pattern',
+                                        fallback='scan*.source.*')
 
     # -- observation --
     params['telescope'] = config.get('observation', 'telescope', fallback='KM40m')
@@ -1294,13 +1299,19 @@ def discover_mark5b_scans(directory, pattern='scan*.source.*'):
             f"目录 {directory} 中未找到匹配 '{pattern}' 的 Mark5B scan 文件"
         )
 
-    # 按文件名中的数字排序
-    def extract_scan_number(filepath):
+    # 按文件名中的数字排序（支持 scan1.source1, scan1.source2 格式）
+    def extract_scan_and_source_number(filepath):
         basename = os.path.basename(filepath)
-        match = re.search(r'scan(\d+)', basename)
-        return int(match.group(1)) if match else 0
+        scan_match = re.search(r'scan(\d+)', basename)
+        source_match = re.search(r'source(\d+)', basename)
 
-    files_sorted = sorted(scan_files, key=extract_scan_number)
+        scan_num = int(scan_match.group(1)) if scan_match else 0
+        source_num = int(source_match.group(1)) if source_match else 0
+
+        # 返回元组 (scan, source) 作为排序键
+        return (scan_num, source_num)
+
+    files_sorted = sorted(scan_files, key=extract_scan_and_source_number)
 
     return files_sorted
 
@@ -1468,7 +1479,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
     data_reader = open_data_file(
         vdif_file, data_format, withsubband, subset,
         sample_rate_value, ref_time_str, nchan,
-        verify_frame=verify_frame)
+        verify_frame=verify_frame, scan_pattern=scan_pattern)
     if data_reader is None:
         print(f"Error opening data file: {vdif_file}")
         return
@@ -1653,7 +1664,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                                 file_obj = open_data_file(
                                     vdif_file, data_format, withsubband, subset,
                                     sample_rate_value, ref_time_str, nchan,
-                                    verify_frame=verify_frame)
+                                    verify_frame=verify_frame, scan_pattern=scan_pattern)
                                 if file_obj is None:
                                     print("\n### WARN: failed to reopen baseband reader; aborting.")
                                     break
@@ -1764,7 +1775,8 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
         params['vdif_file'], params['data_format'], params['withsubband'],
         params['subbands'], sample_rate_value,
         params.get('ref_time', ''), params.get('nchan', 1),
-        verify_frame=params.get('verify_frame', True))
+        verify_frame=params.get('verify_frame', True),
+        scan_pattern=params.get('scan_pattern', 'scan*.source.*'))
     if reader is None:
         print(f"Error opening data file: {params['vdif_file']}")
         return
