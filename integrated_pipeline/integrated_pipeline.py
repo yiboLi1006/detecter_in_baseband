@@ -2,6 +2,10 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v7.13（基于 v7.12 重建）：max_files 仅接受 False 或非负整数；
+  总耗时以小时和分钟显示；CSV 输出实际参考频率及无穷大频率 TOA。
+  保留 v7.12 单文件读取、消色散、检测和拟合流程，不包含 v8 目录模式。
+
 v7.10.2: 进度行尾部加长空格，防止终端 \r 刷新残留旧字符。
 
 v7.10.1: 静默 VDIF segment 和 pulse plot 保存信息，仅进度行显示脉冲计数。
@@ -160,12 +164,12 @@ from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
 
 from dm_correction_module import dm_correct_hdulist
-from pulse_detection_module import detect_pulses_in_hdulist
+from pulse_detection_module import detect_pulses_in_hdulist, validate_toa_parameters
 from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.12"
+__version__ = "v7.13"
 
 
 # =========================================================================
@@ -340,6 +344,25 @@ def _parse_freq_mask_ranges(raw_str):
     return ranges
 
 
+def _parse_max_files(raw_value):
+    """仅 INI 字面值 False 表示无上限，数字必须是非负整数。"""
+    value = raw_value.strip() if raw_value is not None else ''
+    if value == 'False':
+        return float('inf')
+    if value and value.isascii() and value.isdecimal():
+        return int(value)
+    raise ValueError(
+        f"[output] max_files 必须为 False 或非负整数，不得缺省或为空；收到 {raw_value!r}"
+    )
+
+
+def _format_elapsed_time(elapsed_seconds):
+    """以小时和一位小数分钟显示总耗时，舍入进位后分钟不超过 60。"""
+    tenths = round(elapsed_seconds / 6.0)
+    hours, minute_tenths = divmod(tenths, 600)
+    return f"{hours} h {minute_tenths / 10.0:04.1f} min"
+
+
 def read_config(config_file):
     """Read all configuration parameters (extended for integrated pipeline v2)."""
     config = configparser.ConfigParser()
@@ -365,7 +388,7 @@ def read_config(config_file):
 
     # -- output --
     params['max_subints_per_file'] = config.getint('output', 'max_subints_per_file', fallback=2)
-    params['max_files'] = config.getint('output', 'max_files', fallback=1)
+    params['max_files'] = _parse_max_files(config.get('output', 'max_files', fallback=None))
     params['version'] = config.getint('output', 'version', fallback=4)
 
     # -- frequency --
@@ -434,6 +457,11 @@ def read_config(config_file):
         params['dm_ref_freq'] = None
     else:
         params['dm_ref_freq'] = float(ref_freq_str)
+
+    # 读取数据前校验 MHz 参数；保留 ref_freq 缺省值 None 的原有约定。
+    validate_toa_parameters(params['dm_source'], params['center_freq'])
+    if params['dm_ref_freq'] is not None:
+        validate_toa_parameters(params['dm_source'], params['dm_ref_freq'])
 
     # -- detection --
     if config.has_section('detection'):
@@ -1308,6 +1336,9 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
     prefix = f"{worker_label} " if worker_label else ""
     # v7: 全局 hdulist 上限；end_file=None 时退回 max_files（单进程兼容）
     hdulist_hard_limit = max_files if end_file is None else min(max_files, end_file)
+    if start_file >= hdulist_hard_limit:
+        print(f"{prefix}无需处理：起始编号 {start_file} 已达到上限 {hdulist_hard_limit}。")
+        return [] if return_pulses else None
 
     continuous_freqs = None
     if subband_centers is not None and len(subband_centers) == len(subset):
@@ -1606,9 +1637,31 @@ def _worker_process_range(worker_args):
         return (worker_idx, [])
 
 
+def _plan_hdulist_ranges(total_samples, sample_rate_value, params, n_processes):
+    """按实际数据长度、起点和全局排他上限划分非空 worker 区间。"""
+    chunk_size = params['chunk_size']
+    max_subints = params['max_subints_per_file']
+    first = params.get('start_file', 0)
+    start_sample, _, _ = calculate_start_sample(
+        0, first, max_subints, chunk_size, sample_rate_value,
+        params.get('t_start', 0.0))
+    remaining = max(0, total_samples - start_sample)
+    chunks = (remaining + chunk_size - 1) // chunk_size
+    available = (chunks + max_subints - 1) // max_subints
+    stop = int(min(first + available, params['max_files']))
+    count = max(0, stop - first)
+    if count == 0:
+        return []
+    workers = min(n_processes, count)
+    return [(first + i * count // workers, first + (i + 1) * count // workers)
+            for i in range(workers)]
+
+
 def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
-    """v7: 多进程调度。把全局 hdulist 区间 [0, m) 分成 n 段并行处理，
-    合并所有 worker 的 pulse_list 后按 Precise_Abs_MJD_Str 排序，写一个全局 csv。"""
+    """按起点、数据长度和 max_files 划分任务，再合并结果为全局 CSV。"""
+    if params.get('start_file', 0) >= params['max_files']:
+        print("无需处理：起始编号已达到 max_files 上限。")
+        return
     sample_rate_value = _parse_sample_rate(params.get('sample_rate', '32*u.MHz'))
     reader = open_data_file(
         params['vdif_file'], params['data_format'], params['withsubband'],
@@ -1618,15 +1671,16 @@ def run_multiprocess(params, detection_params, dm_ref_freq, n_processes):
     if reader is None:
         print(f"Error opening data file: {params['vdif_file']}")
         return
-    L = reader.shape[0]
-    reader.close()
-
-    chunk_size = params['chunk_size']
-    max_subints = params['max_subints_per_file']
-    total_chunks = max(1, math.ceil(L / chunk_size))
-    m = max(1, math.ceil(total_chunks / max_subints))           # 全局 hdulist 数
-    n_workers = min(n_processes, m)                             # n>m 时多余不启动
-    bounds = [(i * m // n_workers, (i + 1) * m // n_workers) for i in range(n_workers)]
+    try:
+        bounds = _plan_hdulist_ranges(
+            reader.shape[0], reader.sample_rate.to_value(u.Hz), params, n_processes)
+    finally:
+        reader.close()
+    if not bounds:
+        print("无需处理：指定起点后没有可用数据。")
+        return
+    m = sum(he - hs for hs, he in bounds)
+    n_workers = len(bounds)
     print(f"Processing {m} hdulists with {n_workers} workers")
 
     # v7.8: Manager 共享计数器，worker 每完成一个 hdulist 递增
@@ -1724,7 +1778,9 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
     if 'Precise_Abs_MJD_Str' in df.columns:
         df['Precise_Abs_MJD_Str'] = df['Precise_Abs_MJD_Str'].astype(str)
 
-    for extra in ['Precise_JD1', 'Precise_JD2', 'Precise_Abs_MJD_Str']:
+    for extra in ['Precise_JD1', 'Precise_JD2', 'Precise_Abs_MJD_Str',
+                  'TOA_Ref_Freq_MJD', 'TOA_Ref_Freq_UTC',
+                  'TOA_Inf_Freq_MJD', 'TOA_Inf_Freq_UTC']:
         if extra in df.columns and extra not in column_order:
             column_order.append(extra)
 
@@ -1763,7 +1819,11 @@ if __name__ == "__main__":
         print(f"Configuration file not found: {config_file}")
         sys.exit(1)
 
-    params = read_config(config_file)
+    try:
+        params = read_config(config_file)
+    except (ValueError, configparser.Error) as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"VDIF file : {params['vdif_file']}")
     print(f"Source    : {params['source_name']}  DM={params['dm_source']}  "
@@ -1841,6 +1901,6 @@ if __name__ == "__main__":
         )
 
     t1 = time.time()
-    print(f"### USED time: {t1 - t0:.3f} sec")
+    print(f"### USED time: {_format_elapsed_time(t1 - t0)}")
     print(f"### Stop time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     print("#" * 60)

@@ -769,12 +769,45 @@ def _get_observation_start_info_from_hdulist(hdulist):
 # CSV extraction (drops FITS_File column)
 # ---------------------------------------------------------------------------
 
+# 与现有消色散常数一致；MHz 输入，秒输出。
+DM_DELAY_CONSTANT_MHZ = 4.1488064239e3
+
+
+def validate_toa_parameters(dm, ref_freq):
+    """校验 DM 与参考频率，避免输出无法追溯的 NaN 或错误 TOA。"""
+    try:
+        dm = float(dm)
+        ref_freq = float(ref_freq)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TOA 需要数值 DM 和参考频率 ref_freq（MHz）。") from exc
+    if not math.isfinite(dm) or dm < 0:
+        raise ValueError("DM 必须为有限的非负数。")
+    if not math.isfinite(ref_freq) or ref_freq <= 0:
+        raise ValueError("参考频率 ref_freq / center_freq 必须为有限的正数（MHz）。")
+    return dm, ref_freq
+
+
+def _toa_columns(reference_time, dm, ref_freq):
+    """仅扩展输出，不改动拟合结果；无穷大频率 TOA 仍为站上 UTC。"""
+    dm, ref_freq = validate_toa_parameters(dm, ref_freq)
+    time_ref = reference_time.copy()
+    delay_sec = DM_DELAY_CONSTANT_MHZ * dm / ref_freq**2
+    time_inf = time_ref - delay_sec * u.s
+    columns = {}
+    for label, toa in [('Ref', time_ref), ('Inf', time_inf)]:
+        toa.precision = 9
+        # 不先转 float64 MJD，保留双分量 Time 的精度直到字符串输出。
+        columns[f'TOA_{label}_Freq_MJD'] = format(
+            toa.to_value('mjd', subfmt='decimal'), '.15f')
+        columns[f'TOA_{label}_Freq_UTC'] = toa.isot
+    return columns
+
 def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_results,
                                 background_level, noise_sigma,
                                 coarse_relative_times_rounded, coarse_absolute_mjd,
                                 coarse_utc_times,
                                 n_sigma_amplitude, n_sigma_flux,
-                                n_sigma_fit_quality):
+                                n_sigma_fit_quality, dm=None, ref_freq=None):
     pulse_data_list = []
     if len(peaks_detected) == 0:
         return pulse_data_list
@@ -833,6 +866,15 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                 'Precise_JD2': float(jd2_val),
                 'Precise_Abs_MJD_Str': precise_mjd_string,
             })
+
+        if dm is not None and ref_freq is not None:
+            reference_time = result.get('precise_time_timeobj')
+            if reference_time is None:
+                if jd1_val is not None and jd2_val is not None:
+                    reference_time = Time(jd1_val, jd2_val, format='jd', scale='utc')
+                else:
+                    reference_time = Time(precise_abs_mjd, format='mjd', scale='utc')
+            pulse_data.update(_toa_columns(reference_time, dm, ref_freq))
 
         time_error_ms = 0.001
         center_error = 0.0
@@ -895,6 +937,12 @@ def detect_pulses_in_hdulist(hdulist, params):
     manual_mask_ranges = params.get('manual_mask_freq_ranges') or []
     min_prom_factor = params.get('min_prominence_sigma_factor', 0.3)
     tf_window = params.get('rfi_time_freq_window', 200)
+
+    # 从已完成消色散的 HDUList 取实际参考频率，避免与 INI 副本发生分歧。
+    subint_header = hdulist['SUBINT'].header
+    dm, ref_freq = validate_toa_parameters(
+        subint_header.get('DM'),
+        subint_header.get('REFFREQ', hdulist[0].header.get('OBSFREQ')))
 
     # ----- Step 1: Read data from hdulist -----
     data_2d, freqs, times, header_info = _read_psrfits_data_from_hdulist(
@@ -993,6 +1041,7 @@ def detect_pulses_in_hdulist(hdulist, params):
         n_sigma_amplitude=n_sigma_amplitude,
         n_sigma_flux=n_sigma_flux,
         n_sigma_fit_quality=n_sigma_fit_quality,
+        dm=dm, ref_freq=ref_freq,
     )
     # v7.8: 脉冲计数改为 integrated_pipeline 进度行实时刷新
 

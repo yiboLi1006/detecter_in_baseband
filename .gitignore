@@ -47,5 +47,10 @@ Thumbs.db
 # pytest
 .pytest_cache/
 
+# 临时分析及测试产物（正式测试保留在 integrated_pipeline/tests/）
+_tmp/
+_tmp_*
+_test_*
+
 # Claude Code
 .claude/
