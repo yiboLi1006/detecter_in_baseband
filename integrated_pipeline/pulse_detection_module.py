@@ -1,6 +1,9 @@
 """
 Pulse detection module (v5) — operates on an in-memory astropy.io.fits HDUList.
 
+v8.1: optional params['max_fwhm_ms'] rejects candidates whose fitted FWHM exceeds
+the limit (None keeps the v7.13 behaviour). Detection and fitting are unchanged.
+
 v5 change vs v3: TOA precision fix.
 Memory cleanup inherited from v2 is unchanged.
 Detection algorithm and float64 precision are unchanged.
@@ -807,7 +810,8 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                                 coarse_relative_times_rounded, coarse_absolute_mjd,
                                 coarse_utc_times,
                                 n_sigma_amplitude, n_sigma_flux,
-                                n_sigma_fit_quality, dm=None, ref_freq=None):
+                                n_sigma_fit_quality, dm=None, ref_freq=None,
+                                max_fwhm_ms=None):
     pulse_data_list = []
     if len(peaks_detected) == 0:
         return pulse_data_list
@@ -833,6 +837,9 @@ def _extract_pulse_data_for_csv(peaks_detected, final_times, date_obs_iso, fit_r
                 and snr_amp_fit >= n_sigma_amplitude
                 and snr_flux_conv >= n_sigma_flux
                 and snr_fit_quality >= n_sigma_fit_quality):
+            continue
+        # v8.1: 可选脉宽上限，剔除逐 chunk 归一化台阶等造成的 ms 级宽假候选
+        if max_fwhm_ms is not None and result.get('fwhm_ms', 0) > max_fwhm_ms:
             continue
 
         rel_time_ms_txt = coarse_relative_times_rounded[i] * 1000
@@ -937,6 +944,7 @@ def detect_pulses_in_hdulist(hdulist, params):
     manual_mask_ranges = params.get('manual_mask_freq_ranges') or []
     min_prom_factor = params.get('min_prominence_sigma_factor', 0.3)
     tf_window = params.get('rfi_time_freq_window', 200)
+    max_fwhm_ms = params.get('max_fwhm_ms')   # v8.1: None = 不设脉宽上限
 
     # 从已完成消色散的 HDUList 取实际参考频率，避免与 INI 副本发生分歧。
     subint_header = hdulist['SUBINT'].header
@@ -1041,7 +1049,7 @@ def detect_pulses_in_hdulist(hdulist, params):
         n_sigma_amplitude=n_sigma_amplitude,
         n_sigma_flux=n_sigma_flux,
         n_sigma_fit_quality=n_sigma_fit_quality,
-        dm=dm, ref_freq=ref_freq,
+        dm=dm, ref_freq=ref_freq, max_fwhm_ms=max_fwhm_ms,
     )
     # v7.8: 脉冲计数改为 integrated_pipeline 进度行实时刷新
 

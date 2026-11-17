@@ -2,6 +2,16 @@
 """
 Integrated VDIF/Mark5B -> DM correction -> Pulse detection pipeline (see __version__).
 
+v8.1.2：瀑布图独立稳健色标与完整色散窗口；光变曲线沿用原实现。
+
+v8.1.1：兼容单子带一维电压的 mask，保留浮点精度与原有二维处理路径。
+
+v8.1（基于 v7.13）：[dm_correction] method = coherent 时在通道化前做电压域相干消色散
+  （coherent_dedisp_module，逐子带 overlap-save chirp），检测用 HDUList 不再平移通道；
+  原始 PSRFITS 及瀑布图 Raw 面板仍为未消色散数据。[detection] max_fwhm_ms 可选剔除宽假候选。
+  缺省 method = incoherent，与 v7.13 完全一致。本版与 feature/v8.1-directory-mode
+  分支的目录模式无关，不包含目录输入。
+
 v7.13（基于 v7.12 重建）：max_files 仅接受 False 或非负整数；
   总耗时以小时和分钟显示；CSV 输出实际参考频率及无穷大频率 TOA。
   保留 v7.12 单文件读取、消色散、检测和拟合流程，不包含 v8 目录模式。
@@ -151,6 +161,7 @@ import warnings
 import configparser
 import gc
 import ctypes
+import functools
 from multiprocessing import Manager
 
 import numpy as np
@@ -164,12 +175,13 @@ from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
 
 from dm_correction_module import dm_correct_hdulist
+from coherent_dedisp_module import CoherentDedispReader, estimate_extra_bytes, plan_coherent
 from pulse_detection_module import detect_pulses_in_hdulist, validate_toa_parameters
 from vdif_segment_writer import save_baseband_segment
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-__version__ = "v7.13"
+__version__ = "v8.1.2"
 
 
 # =========================================================================
@@ -363,6 +375,51 @@ def _format_elapsed_time(elapsed_seconds):
     return f"{hours} h {minute_tenths / 10.0:04.1f} min"
 
 
+def _parse_dm_method(raw_value):
+    """v8.1: [dm_correction] method 留空为 incoherent；只接受 incoherent / coherent。"""
+    value = (raw_value or '').strip().lower()
+    if value in ('', 'incoherent'):
+        return 'incoherent'
+    if value == 'coherent':
+        return 'coherent'
+    raise ValueError(
+        f"[dm_correction] method 只接受 incoherent 或 coherent；收到 {raw_value!r}")
+
+
+def _parse_max_fwhm_ms(raw_value):
+    """v8.1: [detection] max_fwhm_ms 留空表示不设脉宽上限，否则必须为有限正数（ms）。"""
+    value = (raw_value or '').strip()
+    if value == '':
+        return None
+    try:
+        limit = float(value)
+    except ValueError:
+        limit = math.nan
+    if not (math.isfinite(limit) and limit > 0):
+        raise ValueError(
+            f"[detection] max_fwhm_ms 必须留空或为有限正数（ms）；收到 {raw_value!r}")
+    return limit
+
+
+def _validate_coherent_config(params):
+    """v8.1: 相干消色散按实采样子带构造 chirp，启动前校验采样率与子带中心频率。"""
+    centers = params['subband_centers']
+    if centers is None:
+        if len(params['subbands']) != 1:
+            raise ValueError(
+                "相干消色散：多子带必须提供与 subbands 等长的 subband_centers（MHz）")
+        centers = [params['center_freq']]
+    width = params['subband_width']
+    sample_rate = _parse_sample_rate(params['sample_rate'])
+    if not math.isclose(sample_rate, 2e6 * width, rel_tol=1e-9):
+        raise ValueError(
+            f"相干消色散要求实采样且 sample_rate = 2 × subband_width；"
+            f"当前 {sample_rate / 1e6:g} MHz 与 {width:g} MHz 不符")
+    if min(centers) - width / 2.0 <= 0:
+        raise ValueError(
+            "相干消色散：子带下边缘频率必须为正（subband_centers − subband_width/2 > 0 MHz）")
+
+
 def read_config(config_file):
     """Read all configuration parameters (extended for integrated pipeline v2)."""
     config = configparser.ConfigParser()
@@ -379,7 +436,7 @@ def read_config(config_file):
     # -- observation --
     params['telescope'] = config.get('observation', 'telescope', fallback='KM40m')
     params['source_name'] = config.get('observation', 'source_name', fallback='B0531+21')
-    params['dm_source'] = config.getfloat('observation', 'dm_source', fallback=57.6)
+    params['dm_source'] = config.getfloat('observation', 'dm_source', fallback=56.73)
     params['t_start'] = config.getfloat('observation', 't_start', fallback=0.0)
     params['ref_time'] = config.get('observation', 'ref_time', fallback='')
     params['start_file'] = config.getint('observation', 'start_file', fallback=0)
@@ -451,12 +508,15 @@ def read_config(config_file):
 
     # -- dm_correction --
     ref_freq_str = ''
+    method_str = ''
     if config.has_section('dm_correction'):
         ref_freq_str = config.get('dm_correction', 'ref_freq', fallback='').strip()
+        method_str = config.get('dm_correction', 'method', fallback='')
     if ref_freq_str == '':
         params['dm_ref_freq'] = None
     else:
         params['dm_ref_freq'] = float(ref_freq_str)
+    params['dm_method'] = _parse_dm_method(method_str)   # v8.1
 
     # 读取数据前校验 MHz 参数；保留 ref_freq 缺省值 None 的原有约定。
     validate_toa_parameters(params['dm_source'], params['center_freq'])
@@ -473,6 +533,8 @@ def read_config(config_file):
             'detection', 'sigma_remove_rfi_frequency', fallback=5.0)
         params['sigma_remove_rfi_time_frequency'] = config.getfloat(
             'detection', 'sigma_remove_rfi_time_frequency', fallback=9.0)
+        params['max_fwhm_ms'] = _parse_max_fwhm_ms(
+            config.get('detection', 'max_fwhm_ms', fallback=''))   # v8.1
     else:
         params['amp_snr_threshold'] = 4.0
         params['flux_snr_threshold'] = 4.0
@@ -480,6 +542,7 @@ def read_config(config_file):
         params['peak_distance'] = 5000
         params['sigma_remove_rfi_frequency'] = 5.0
         params['sigma_remove_rfi_time_frequency'] = 9.0
+        params['max_fwhm_ms'] = None
 
     # -- detection_manual_mask --
     if config.has_section('detection_manual_mask'):
@@ -508,6 +571,9 @@ def read_config(config_file):
         params['cleanup_every_n_hdulists'] = 50
         params['n_processes'] = 1
 
+    if params['dm_method'] == 'coherent':
+        _validate_coherent_config(params)
+
     return params
 
 
@@ -535,6 +601,10 @@ def check_parameters(chunk_size, reduction_factor, nchans):
 # =========================================================================
 
 def flag_xband_data(data, mask=[np.nan, np.nan, 1, 1, 1, 1, 1, 1]):
+    # Single-subband readers may squeeze the column axis; keep voltage precision.
+    if data.ndim == 1 and len(mask) == 1:
+        weight = np.asarray(mask, dtype=data.dtype)[0]
+        return data * weight
     if data.T.shape[0] != len(mask):
         print("mask length != subband number")
         return data
@@ -1031,7 +1101,10 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                                         source_name_for_file=None,
                                         telescope_for_file=None,
                                         version_for_file=0,
-                                        plot_output_dir=None):
+                                        plot_output_dir=None,
+                                        # ---------- v8.1 params ----------
+                                        dm_method='incoherent',
+                                        raw_subint_loader=None):
     n_subints = len(subint_data_list)
     if n_subints == 0:
         print("\nNo subint data to write")
@@ -1077,12 +1150,17 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     hdulist = fits.HDUList([primary_hdu, table_hdu])
     del cols  # v2: column list no longer needed after BinTable is built
 
-    # DM correction is IN-PLACE on `hdulist` (v3 memory fix)
-    dm_correct_hdulist(
-        hdulist, dm=dm_value,
-        ref_freq=dm_ref_freq if dm_ref_freq is not None else center_freq,
-        method='freq_domain', normalize=True,
-    )
+    if dm_method == 'coherent':
+        # v8.1: 电压已在通道化前完成相干消色散，DM/REFFREQ 已写入表头，不再平移通道
+        th['HISTORY'] = f"Coherent (voltage-domain) dedispersion applied upstream, DM = {th['DM']}"
+        th['HISTORY'] = f"DM reference frequency: {th['REFFREQ']} MHz"
+    else:
+        # DM correction is IN-PLACE on `hdulist` (v3 memory fix)
+        dm_correct_hdulist(
+            hdulist, dm=dm_value,
+            ref_freq=dm_ref_freq if dm_ref_freq is not None else center_freq,
+            method='freq_domain', normalize=True,
+        )
 
     pulse_data_list = detect_pulses_in_hdulist(hdulist, detection_params)
 
@@ -1109,10 +1187,14 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     for pd in pulse_data_list:
         pd['Fits'] = fits_basename
 
+    # v8.1: 原始 PSRFITS 与瀑布图始终使用未消色散数据；相干模式按 chunk 重读原始电压
+    raw_subint_data_list = (raw_subint_loader() if raw_subint_loader is not None
+                            else subint_data_list)
+
     # v5b.1: build raw hdulist in float32 first -- preserves NaN for plotting;
     # uint8 conversion happens after plotting, just before writeto.
     raw_cols, raw_nsamples, raw_nsubints, raw_nchans = create_table_columns(
-        subint_data_list, subint_offsets_list, tsamp, center_freq,
+        raw_subint_data_list, subint_offsets_list, tsamp, center_freq,
         nchans, chan_bw, coord, file_counter, continuous_freqs,
     )
     raw_primary = create_primary_header(
@@ -1173,6 +1255,7 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
                 raw_out, None, pulse_data_list, plot_output_dir,
                 src, tel, file_counter, version,
                 raw_hdulist=raw_hdulist, corrected_hdulist=hdulist,
+                dm=th['DM'], ref_freq=th['REFFREQ'],
             )
         except Exception as e:
             print(f"  WARNING: failed to plot pulse waterfalls: {e}")
@@ -1196,10 +1279,11 @@ def write_psrfits_file_multiple_subints(subint_data_list, subint_times_list,
     del raw_hdulist
 
     u_cols, u_nsamples, u_nsubints, u_nchans = create_table_columns(
-        subint_data_list, subint_offsets_list, tsamp, center_freq,
+        raw_subint_data_list, subint_offsets_list, tsamp, center_freq,
         nchans, chan_bw, coord, file_counter, continuous_freqs,
         data_format='B',
     )
+    del raw_subint_data_list
     u_table = fits.BinTableHDU.from_columns(u_cols, name='SUBINT')
     uth = u_table.header
     uth['INT_TYPE'] = 'TIME'
@@ -1291,6 +1375,22 @@ def calculate_start_sample(file_counter, start_file, max_subints_per_file,
     return start_sample, file_counter, t_start
 
 
+def _coherent_setup(sample_rate_hz, subband_centers, center_freq, subband_width,
+                    usb, usb_list, mask, dm, ref_freq, block_len, chunk_size):
+    """v8.1: 汇总相干消色散的子带参数与计划，返回 (plan, centers, sidebands, active)。
+
+    单子带未给 subband_centers 时以 center_freq 为中心；mask 长度与子带数不符时
+    视为全部有效（与 flag_xband_data 的回退一致）。
+    """
+    centers = list(subband_centers) if subband_centers is not None else [center_freq]
+    sidebands = list(usb_list) if usb_list is not None else [usb] * len(centers)
+    active = ([bool(m) for m in mask] if len(mask) == len(centers)
+              else [True] * len(centers))
+    plan = plan_coherent(sample_rate_hz, centers, subband_width, active, dm, ref_freq,
+                         block_len=block_len, chunk_size=chunk_size)
+    return plan, centers, sidebands, active
+
+
 # =========================================================================
 # *** MODIFIED in v2 ***  main loop with chunk-level del + periodic
 # gc.collect + malloc_trim every N hdulists.
@@ -1319,7 +1419,9 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                     end_file=None,          # 全局 hdulist 上限（不含）；None 退回 max_files
                     return_pulses=False,    # True: 不内部写 csv，返回 pulse_list
                     worker_label=None,      # 日志前缀 "[worker i]"；None 无前缀
-                    shared_hdulist_counter=None):  # Manager.Value('i') 多进程全局 hdulist 计数
+                    shared_hdulist_counter=None,  # Manager.Value('i') 多进程全局 hdulist 计数
+                    # ------------- v8.1 params --------------
+                    dm_method='incoherent'):  # 'coherent': 通道化前电压域相干消色散
     """Integrated VDIF -> DM correction -> pulse detection -> CSV pipeline (v2)."""
     pulsar_coords = {
         "B0531+21": SkyCoord('05h34m31.97s', '+22d00m52.1s', frame='icrs'),
@@ -1346,10 +1448,49 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
         continuous_freqs, _ = create_continuous_frequency_array(
             subband_centers, bandwidth, nchans, channel_bandwidth)
 
-    data_reader = open_data_file(
-        vdif_file, data_format, withsubband, subset,
-        sample_rate_value, ref_time_str, nchan,
-        verify_frame=verify_frame)
+    # v8.1: 相干模式用 CoherentDedispReader 包装读取器；DM=0 或没有有效子带时不包装
+    coherent_wrap = None
+    if dm_method == 'coherent':
+        coherent_dm = dm_value if dm_value is not None else dm
+        coherent_ref = dm_ref_freq if dm_ref_freq is not None else center_freq
+        plan, centers, sidebands, active = _coherent_setup(
+            sample_rate_value, subband_centers, center_freq, bandwidth, usb, usb_list,
+            mask, coherent_dm, coherent_ref, chunk_size * max_subints_per_file, chunk_size)
+        if plan is not None:
+            coherent_wrap = functools.partial(
+                CoherentDedispReader, plan=plan, centers=centers, width=bandwidth,
+                sidebands=sidebands, active=active, dm=coherent_dm, ref_freq=coherent_ref)
+
+    def _open_reader():
+        reader = open_data_file(
+            vdif_file, data_format, withsubband, subset,
+            sample_rate_value, ref_time_str, nchan,
+            verify_frame=verify_frame)
+        if reader is None or coherent_wrap is None:
+            return reader
+        return coherent_wrap(reader)
+
+    def _channelize(chunk_data):
+        """v8.1: 主循环与原始 PSRFITS 重建共用同一套通道化参数。"""
+        return Process_vdif_data_multiband(
+            chunk_data, reduction_factor, nchans, usb=usb, usb_list=usb_list,
+            subband_centers=subband_centers, subband_width=bandwidth,
+            create_continuous=True, flag_edge_channels=flag_edge_channels,
+            calibrate_flux=calibrate_flux, calibrate_bandpass=calibrate_bandpass,
+            bspline_degree=bspline_degree, bspline_smooth=bspline_smooth,
+        )
+
+    def _load_raw_subints(chunk_ranges):
+        """v8.1: 相干模式检出脉冲时，按原 chunk 重读未消色散电压（供原始 PSRFITS 与瀑布图）。"""
+        raw_reader = file_obj.raw
+        subints = []
+        for chunk_first, chunk_count in chunk_ranges:
+            raw_reader.seek(chunk_first)
+            subints.append(_channelize(
+                flag_xband_data(raw_reader.read(chunk_count), mask=mask_array)))
+        return subints
+
+    data_reader = _open_reader()
     if data_reader is None:
         print(f"Error opening data file: {vdif_file}")
         return
@@ -1421,13 +1562,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                     del raw_data, chunk_data
                     break
 
-                processed_data = Process_vdif_data_multiband(
-                    chunk_data, reduction_factor, nchans, usb=usb, usb_list=usb_list,
-                    subband_centers=subband_centers, subband_width=bandwidth,
-                    create_continuous=True, flag_edge_channels=flag_edge_channels,
-                    calibrate_flux=calibrate_flux, calibrate_bandpass=calibrate_bandpass,
-                    bspline_degree=bspline_degree, bspline_smooth=bspline_smooth,
-                )
+                processed_data = _channelize(chunk_data)
                 if processed_data.size == 0:
                     print(f"\nNo data after processing chunk {current_subint}, skipping")
                     del raw_data, chunk_data, processed_data
@@ -1480,6 +1615,10 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                             telescope_for_file=telescope,
                             version_for_file=version,
                             plot_output_dir=plot_output_dir,
+                            dm_method=dm_method,
+                            raw_subint_loader=(
+                                functools.partial(_load_raw_subints, list(subint_chunk_ranges))
+                                if coherent_wrap is not None else None),
                         )
                         cumulative_pulses += n_pulses
 
@@ -1531,10 +1670,7 @@ def vdif_to_psrfits(vdif_file, reduction_factor=32, subset=[0],
                                 except Exception:
                                     pass
 
-                                file_obj = open_data_file(
-                                    vdif_file, data_format, withsubband, subset,
-                                    sample_rate_value, ref_time_str, nchan,
-                                    verify_frame=verify_frame)
+                                file_obj = _open_reader()
                                 if file_obj is None:
                                     print("\n### WARN: failed to reopen baseband reader; aborting.")
                                     break
@@ -1628,6 +1764,7 @@ def _worker_process_range(worker_args):
             return_pulses=True,                     # v7: 返回 pulse_list
             worker_label=worker_label,              # v7: 日志前缀
             shared_hdulist_counter=worker_args.get('shared_hdulist_counter'),
+            dm_method=params.get('dm_method', 'incoherent'),   # v8.1
         ) or []
         return (worker_idx, pulse_list)
     except Exception as e:
@@ -1800,6 +1937,30 @@ def _save_pulse_collector_csv(pulse_data_list, csv_base_path):
     return csv_base_path
 
 
+def _print_dedispersion_setup(params, dm_ref_freq):
+    """v8.1: 启动时打印消色散方式；相干模式给出重叠、FFT 长度与每进程额外内存估计。"""
+    if params['dm_method'] != 'coherent':
+        print("Dedisp    : incoherent (per-channel shifts)")
+        return
+    plan, centers, _, active = _coherent_setup(
+        _parse_sample_rate(params['sample_rate']), params['subband_centers'],
+        params['center_freq'], params['subband_width'], params['usb'], params['usb_list'],
+        params['mask_sband'], params['dm_source'], dm_ref_freq,
+        params['chunk_size'] * params['max_subints_per_file'], params['chunk_size'])
+    if plan is None:
+        print("Dedisp    : coherent (DM = 0 或无有效子带，直接使用原始电压)")
+        return
+    extra = estimate_extra_bytes(plan, len(centers), sum(active))
+    print(f"Dedisp    : coherent  ref={dm_ref_freq} MHz  "
+          f"overlap -{plan['hist_ms']:.2f}/+{plan['look_ms']:.2f} ms  "
+          f"FFT={plan['fft_len']}  extra≈{extra / 2 ** 30:.2f} GiB/process")
+    n_processes = max(1, params.get('n_processes', 1))
+    if _HAS_PSUTIL and extra * n_processes > 0.7 * _psutil.virtual_memory().total:
+        print(f"### WARNING: 相干消色散额外内存约 {extra * n_processes / 2 ** 30:.1f} GiB"
+              f"（{n_processes} 进程），超过物理内存的 70%；"
+              f"建议减少 n_processes 或 max_subints_per_file")
+
+
 # =========================================================================
 # main
 # =========================================================================
@@ -1842,12 +2003,16 @@ if __name__ == "__main__":
         'sigma_remove_rfi_frequency': params['sigma_remove_rfi_frequency'],
         'sigma_remove_rfi_time_frequency': params['sigma_remove_rfi_time_frequency'],
         'manual_mask_freq_ranges': params['detection_freq_mask_ranges'],
+        'max_fwhm_ms': params['max_fwhm_ms'],   # v8.1
     }
 
     dm_ref_freq = params['dm_ref_freq']
     if dm_ref_freq is None:
         dm_ref_freq = params['center_freq']
         print(f"DM ref_freq blank in ini; defaulting to center_freq = {dm_ref_freq} MHz")
+    _print_dedispersion_setup(params, dm_ref_freq)
+    if params['max_fwhm_ms'] is not None:
+        print(f"Max FWHM  : {params['max_fwhm_ms']} ms")
 
     if not check_parameters(params['chunk_size'], params['reduction_factor'],
                             params['nchans']):
@@ -1898,6 +2063,7 @@ if __name__ == "__main__":
             cleanup_every_n_hdulists=params['cleanup_every_n_hdulists'],
             verify_frame=params.get('verify_frame', True),
             end_file=None, return_pulses=False, worker_label=None,
+            dm_method=params['dm_method'],   # v8.1
         )
 
     t1 = time.time()

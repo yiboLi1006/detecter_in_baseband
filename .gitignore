@@ -3,6 +3,8 @@
 # =========================================================================
 /*
 !/integrated_pipeline
+!/README.md
+!/requirements.txt
 
 # =========================================================================
 #  Standard ignores (applied within integrated_pipeline/)
@@ -51,6 +53,9 @@ Thumbs.db
 _tmp/
 _tmp_*
 _test_*
+
+# AI 接手文档：本地维护，不纳入 git 管理
+AI_接手文档.md
 
 # Claude Code
 .claude/
